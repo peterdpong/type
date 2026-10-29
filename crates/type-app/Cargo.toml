@@ -15,6 +15,9 @@ markdown-core = { path = "../markdown-core" }
 anyhow = "1"
 tempfile = "3"
 
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 

@@ -1,3 +1,4 @@
+mod rename;
 mod switcher;
 mod tabs;
 
@@ -19,6 +20,8 @@ struct Tab {
     id: TabId,
     editor: Entity<MarkdownEditor>,
     path: Option<PathBuf>,
+    draft_name: Option<String>,
+    renaming_to: Option<PathBuf>,
     saved: String,
     saving_to: Option<PathBuf>,
     _subscription: Subscription,
@@ -30,6 +33,7 @@ impl Tab {
             .as_ref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
+            .or_else(|| self.draft_name.clone())
             .unwrap_or_else(|| {
                 if self.id == 0 {
                     "Untitled".into()
@@ -40,17 +44,25 @@ impl Tab {
     }
 
     fn dirty(&self, cx: &App) -> bool {
-        self.editor.read(cx).markdown() != self.saved
+        (self.path.is_none() && self.draft_name.is_some())
+            || self.editor.read(cx).markdown() != self.saved
     }
 
     fn empty(&self, cx: &App) -> bool {
         self.path.is_none()
-            && self.saving_to.is_none()
+            && self.draft_name.is_none()
+            && !self.busy()
             && self.editor.read(cx).markdown().is_empty()
     }
 
+    fn busy(&self) -> bool {
+        self.saving_to.is_some() || self.renaming_to.is_some()
+    }
+
     fn owns(&self, path: &Path) -> bool {
-        self.path.as_deref() == Some(path) || self.saving_to.as_deref() == Some(path)
+        self.path.as_deref() == Some(path)
+            || self.saving_to.as_deref() == Some(path)
+            || self.renaming_to.as_deref() == Some(path)
     }
 }
 
@@ -78,6 +90,7 @@ pub(crate) struct Workspace {
     notice: Entity<Notice>,
     focus: FocusHandle,
     switcher: Option<switcher::TabSwitcher>,
+    rename: Option<rename::Rename>,
     _resize_subscription: Subscription,
     _activation_subscription: Subscription,
 }
@@ -106,10 +119,12 @@ impl Workspace {
             notice: cx.new(|_| Notice::default()),
             focus: cx.focus_handle(),
             switcher: None,
+            rename: None,
             _resize_subscription: cx.observe_window_bounds(window, |_, _, cx| cx.notify()),
             _activation_subscription: cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.cancel_switcher(window, cx);
+                    this.cancel_rename(true, window, cx);
                 }
             }),
         }
@@ -133,6 +148,8 @@ impl Workspace {
             id,
             editor,
             path,
+            draft_name: None,
+            renaming_to: None,
             saved: text,
             saving_to: None,
             _subscription: subscription,
@@ -144,13 +161,16 @@ impl Workspace {
     }
 
     fn focus_editor(&self, window: &mut Window, cx: &App) {
-        window.focus(&self.active_tab().editor.focus_handle(cx));
+        if self.rename.is_none() {
+            window.focus(&self.active_tab().editor.focus_handle(cx));
+        }
     }
 
     fn activate(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         if !self.tabs.iter().any(|tab| tab.id == id) {
             return;
         }
+        self.cancel_rename(false, window, cx);
         self.switcher = None;
         if self.active != id {
             self.active_tab()
@@ -186,6 +206,7 @@ impl Workspace {
     }
 
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_rename(false, window, cx);
         if self.dialog_busy || self.closing.is_some() {
             return;
         }
@@ -290,13 +311,17 @@ impl Workspace {
     }
 
     fn save(&mut self, id: TabId, save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename.is_some() {
+            self.confirm_rename(Some(save_as), window, cx);
+            return;
+        }
         if self.dialog_busy {
             return;
         }
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
             return;
         };
-        if tab.saving_to.is_some() {
+        if tab.busy() {
             return;
         }
         tab.editor
@@ -312,7 +337,7 @@ impl Workspace {
             .map(PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let suggested = if tab.path.is_some() {
+        let suggested = if tab.path.is_some() || tab.draft_name.is_some() {
             tab.name()
         } else {
             format!("{}.md", tab.name())
@@ -352,7 +377,7 @@ impl Workspace {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             return;
         };
-        if tab.saving_to.is_some() {
+        if tab.busy() {
             return;
         }
         let text = tab.editor.read(cx).markdown().to_string();
@@ -379,6 +404,7 @@ impl Workspace {
                             editor.set_document_path(Some(path.clone()), cx)
                         });
                         tab.path = Some(path);
+                        tab.draft_name = None;
                         tab.saved = text;
                         let message = if tab.dirty(cx) {
                             "Saved · new edits remain"
@@ -401,6 +427,7 @@ impl Workspace {
     }
 
     fn request_close(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_rename(true, window, cx);
         self.cancel_switcher(window, cx);
         if self.dialog_busy || self.closing.is_some() {
             return;
@@ -444,7 +471,7 @@ impl Workspace {
                 CloseTarget::Window => true,
             })
             .collect::<Vec<_>>();
-        if affected.iter().any(|tab| tab.saving_to.is_some()) {
+        if affected.iter().any(|tab| tab.busy()) {
             return;
         }
         let dirty = affected.into_iter().find(|tab| {
@@ -565,6 +592,9 @@ impl Render for Workspace {
                 }),
             )
             .on_key_down(cx.listener(Self::switcher_key_down))
+            .on_action(
+                cx.listener(|this, _: &crate::Rename, w, cx| this.begin_rename(this.active, w, cx)),
+            )
             .on_action(cx.listener(|this, _: &New, w, cx| this.new_tab(w, cx)))
             .on_action(cx.listener(|this, _: &Open, w, cx| this.open(w, cx)))
             .on_action(cx.listener(|this, _: &Save, w, cx| {

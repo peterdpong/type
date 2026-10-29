@@ -136,13 +136,37 @@ impl Workspace {
                             .when(!active, |view| {
                                 view.hover(|style| style.bg(rgb(appearance::CHROME_HOVER)))
                             })
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    this.activate(id, window, cx)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    if event.click_count == 2 {
+                                        this.begin_rename(id, window, cx);
+                                    }
                                 }),
                             )
-                            .child(div().min_w_0().flex_1().truncate().child(label))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if !this.rename.as_ref().is_some_and(|r| r.id == id) {
+                                    this.activate(id, window, cx);
+                                }
+                            }))
+                            .child(
+                                if let Some(rename) = self.rename.as_ref().filter(|r| r.id == id) {
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .h(px(22.))
+                                        .child(rename.input.clone())
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .child(label)
+                                        .into_any_element()
+                                },
+                            )
                             .when(tab.dirty(cx), |view| {
                                 view.child(
                                     div()

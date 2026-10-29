@@ -5802,6 +5802,7 @@ dependencies = [
  "anyhow",
  "gpui",
  "markdown-core",
+ "rustix 1.1.5",
  "tempfile",
 ]
 

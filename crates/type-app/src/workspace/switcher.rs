@@ -96,6 +96,7 @@ impl Workspace {
         if self.tabs.len() < 2 || self.dialog_busy || self.closing.is_some() {
             return;
         }
+        self.cancel_rename(false, window, cx);
         if self.switcher.is_none() {
             self.active_tab()
                 .editor
@@ -186,7 +187,9 @@ impl Workspace {
         let selected = self.tabs.iter().find(|tab| tab.id == selected_id)?;
         let editor = selected.editor.read(cx);
         let words = editor.word_count();
-        let status = if selected.saving_to.is_some() {
+        let status = if selected.renaming_to.is_some() {
+            "Renaming…"
+        } else if selected.saving_to.is_some() {
             "Saving…"
         } else if selected.dirty(cx) {
             "Unsaved changes"

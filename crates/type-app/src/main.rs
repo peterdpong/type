@@ -13,6 +13,7 @@ actions!(
         Open,
         Save,
         SaveAs,
+        Rename,
         Close,
         CloseWindow,
         Quit,
@@ -31,6 +32,7 @@ fn init(cx: &mut App) {
         "ctrl"
     };
     cx.bind_keys([
+        KeyBinding::new("f2", Rename, None),
         KeyBinding::new(&format!("{command}-n"), New, None),
         KeyBinding::new(&format!("{command}-t"), New, None),
         KeyBinding::new(&format!("{command}-o"), Open, None),
@@ -57,6 +59,7 @@ fn init(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Save", Save),
                 MenuItem::action("Save As…", SaveAs),
+                MenuItem::action("Rename…", Rename),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", Close),
                 MenuItem::action("Close Window", CloseWindow),
