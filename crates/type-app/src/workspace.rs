@@ -1,3 +1,4 @@
+mod motion;
 mod rename;
 mod switcher;
 mod tabs;
@@ -86,10 +87,12 @@ pub(crate) struct Workspace {
     dialog_busy: bool,
     closing: Option<Closing>,
     tab_scroll: ScrollHandle,
+    tab_header: tabs::Header,
     tab_viewport_width: Pixels,
     notice: Entity<Notice>,
     focus: FocusHandle,
     switcher: Option<switcher::TabSwitcher>,
+    fading_switcher: Option<switcher::TabSwitcher>,
     rename: Option<rename::Rename>,
     _resize_subscription: Subscription,
     _activation_subscription: Subscription,
@@ -115,14 +118,17 @@ impl Workspace {
             dialog_busy: false,
             closing: None,
             tab_scroll: ScrollHandle::new(),
+            tab_header: tabs::Header::default(),
             tab_viewport_width: px(0.),
             notice: cx.new(|_| Notice::default()),
             focus: cx.focus_handle(),
             switcher: None,
+            fading_switcher: None,
             rename: None,
             _resize_subscription: cx.observe_window_bounds(window, |_, _, cx| cx.notify()),
             _activation_subscription: cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
+                    this.finish_tab_drag(true, window, cx);
                     this.cancel_switcher(window, cx);
                     this.cancel_rename(true, window, cx);
                 }
@@ -161,7 +167,7 @@ impl Workspace {
     }
 
     fn focus_editor(&self, window: &mut Window, cx: &App) {
-        if self.rename.is_none() {
+        if self.rename.is_none() && !self.tab_header.is_dragging() {
             window.focus(&self.active_tab().editor.focus_handle(cx));
         }
     }
@@ -170,8 +176,9 @@ impl Workspace {
         if !self.tabs.iter().any(|tab| tab.id == id) {
             return;
         }
+        self.finish_tab_drag(true, window, cx);
         self.cancel_rename(false, window, cx);
-        self.switcher = None;
+        self.dismiss_switcher(cx);
         if self.active != id {
             self.active_tab()
                 .editor
@@ -206,6 +213,7 @@ impl Workspace {
     }
 
     fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_tab_drag(true, window, cx);
         self.cancel_rename(false, window, cx);
         if self.dialog_busy || self.closing.is_some() {
             return;
@@ -311,6 +319,7 @@ impl Workspace {
     }
 
     fn save(&mut self, id: TabId, save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_tab_drag(true, window, cx);
         if self.rename.is_some() {
             self.confirm_rename(Some(save_as), window, cx);
             return;
@@ -427,6 +436,7 @@ impl Workspace {
     }
 
     fn request_close(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_tab_drag(true, window, cx);
         self.cancel_rename(true, window, cx);
         self.cancel_switcher(window, cx);
         if self.dialog_busy || self.closing.is_some() {
@@ -562,9 +572,11 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.tab_viewport_width != window.viewport_size().width {
+            self.finish_tab_drag(true, window, cx);
             self.tab_viewport_width = window.viewport_size().width;
             self.reveal_active_tab(window);
         }
+        self.prepare_tab_header(window, cx);
         let tab = self.active_tab();
         window.set_window_title(&format!(
             "{}{} — Type",
@@ -591,7 +603,11 @@ impl Render for Workspace {
                     }
                 }),
             )
-            .on_key_down(cx.listener(Self::switcher_key_down))
+            .on_key_down(cx.listener(|this, event, window, cx| {
+                if !this.tab_drag_key_down(event, window, cx) {
+                    this.switcher_key_down(event, window, cx);
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &crate::Rename, w, cx| this.begin_rename(this.active, w, cx)),
             )

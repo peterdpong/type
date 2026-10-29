@@ -28,3 +28,9 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 npm run format:check
 ```
+
+Run the native header input checks on macOS:
+
+```sh
+cargo run -p type-app --example native_header_input
+```

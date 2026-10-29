@@ -1,16 +1,22 @@
-use super::{TabId, Workspace};
+use super::{TabId, Workspace, motion::Motion};
 use gpui::{prelude::*, *};
 use markdown_core::{MarkdownPreview, appearance};
+use std::time::{Duration, Instant};
 
 const CARD_WIDTH: f32 = 168.;
 const CARD_HEIGHT: f32 = 152.;
 const GAP: f32 = 12.;
 const PADDING: f32 = 16.;
-const FRAME_HEIGHT: f32 = 158.;
+const FRAME_HEIGHT: f32 = PADDING * 2. + 2.;
+const OPEN: Duration = Duration::from_millis(140);
+const CLOSE: Duration = Duration::from_millis(90);
+const HIGHLIGHT: Duration = Duration::from_millis(90);
 
 struct Item {
     id: TabId,
+    title: SharedString,
     preview: MarkdownPreview,
+    highlight: Motion,
 }
 
 pub(super) struct TabSwitcher {
@@ -18,6 +24,7 @@ pub(super) struct TabSwitcher {
     selected: usize,
     scroll: ScrollHandle,
     revealed: Option<(Size<Pixels>, usize)>,
+    visibility: Motion,
 }
 
 struct Metrics {
@@ -28,6 +35,22 @@ struct Metrics {
 }
 
 impl TabSwitcher {
+    fn select(&mut self, index: usize, now: Instant) {
+        self.selected = index;
+        for (i, item) in self.items.iter_mut().enumerate() {
+            item.highlight = Motion::new(
+                item.highlight.value(now),
+                if i == index { 1. } else { 0. },
+                now,
+                HIGHLIGHT,
+            );
+        }
+    }
+
+    fn moving(&self, now: Instant) -> bool {
+        self.visibility.moving(now) || self.items.iter().any(|item| item.highlight.moving(now))
+    }
+
     fn metrics(&self, window: &Window) -> Metrics {
         let viewport = window.viewport_size();
         let columns =
@@ -76,16 +99,6 @@ impl TabSwitcher {
     }
 }
 
-fn byte_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.)
-    } else {
-        format!("{:.1} MB", bytes as f64 / (1024. * 1024.))
-    }
-}
-
 impl Workspace {
     pub(super) fn step_switcher(
         &mut self,
@@ -96,8 +109,14 @@ impl Workspace {
         if self.tabs.len() < 2 || self.dialog_busy || self.closing.is_some() {
             return;
         }
+        self.finish_tab_drag(true, window, cx);
         self.cancel_rename(false, window, cx);
         if self.switcher.is_none() {
+            let now = cx.background_executor().now();
+            let visibility = self
+                .fading_switcher
+                .take()
+                .map_or(0., |switcher| switcher.visibility.value(now));
             self.active_tab()
                 .editor
                 .update(cx, |editor, cx| editor.deactivate(window, cx));
@@ -107,7 +126,9 @@ impl Workspace {
                     .iter()
                     .map(|tab| Item {
                         id: tab.id,
+                        title: tab.name().into(),
                         preview: tab.editor.read(cx).preview(),
+                        highlight: Motion::new(0., 0., now, HIGHLIGHT),
                     })
                     .collect(),
                 selected: self
@@ -117,6 +138,7 @@ impl Workspace {
                     .unwrap(),
                 scroll: ScrollHandle::new(),
                 revealed: None,
+                visibility: Motion::new(visibility, 1., now, OPEN),
             });
             window.focus(&self.focus);
         }
@@ -125,21 +147,32 @@ impl Workspace {
 
     fn move_switcher(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let Some(switcher) = &mut self.switcher {
-            switcher.selected = (switcher.selected as isize + delta)
+            let index = (switcher.selected as isize + delta)
                 .rem_euclid(switcher.items.len() as isize) as usize;
+            switcher.select(index, cx.background_executor().now());
             cx.notify();
         }
     }
 
     pub(super) fn commit_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(switcher) = self.switcher.take() {
+        if let Some(switcher) = &self.switcher {
             self.activate(switcher.items[switcher.selected].id, window, cx);
         }
     }
 
     pub(super) fn cancel_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.switcher.take().is_some() {
+        if self.switcher.is_some() {
+            self.dismiss_switcher(cx);
             self.focus_editor(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn dismiss_switcher(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut switcher) = self.switcher.take() {
+            let now = cx.background_executor().now();
+            switcher.visibility = Motion::new(switcher.visibility.value(now), 0., now, CLOSE);
+            self.fading_switcher = Some(switcher);
             cx.notify();
         }
     }
@@ -180,45 +213,39 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        self.switcher.as_mut()?.reveal_selection(window);
-        let switcher = self.switcher.as_ref()?;
-        let metrics = switcher.metrics(window);
-        let selected_id = switcher.items[switcher.selected].id;
-        let selected = self.tabs.iter().find(|tab| tab.id == selected_id)?;
-        let editor = selected.editor.read(cx);
-        let words = editor.word_count();
-        let status = if selected.renaming_to.is_some() {
-            "Renaming…"
-        } else if selected.saving_to.is_some() {
-            "Saving…"
-        } else if selected.dirty(cx) {
-            "Unsaved changes"
-        } else if selected.path.is_some() {
-            "Saved"
-        } else {
-            "Not saved"
-        };
-        let location = selected
-            .path
+        let now = cx.background_executor().now();
+        if self
+            .fading_switcher
             .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "Unsaved document".into());
-        let detail = format!(
-            "{words} {} · {} · {status}",
-            if words == 1 { "word" } else { "words" },
-            byte_size(editor.markdown().len())
-        );
-        let rows = switcher.items.chunks(metrics.columns).map(|items| {
-            div()
-                .flex()
-                .gap(px(GAP))
-                .h(px(CARD_HEIGHT))
-                .flex_shrink_0()
-                .children(items.iter().filter_map(|item| {
-                    let tab = self.tabs.iter().find(|tab| tab.id == item.id)?;
-                    let id = item.id;
-                    let selected = selected_id == id;
-                    Some(
+            .is_some_and(|s| !s.visibility.moving(now))
+        {
+            self.fading_switcher = None;
+        }
+        let interactive = self.switcher.is_some();
+        let switcher = self.switcher.as_mut().or(self.fading_switcher.as_mut())?;
+        switcher.reveal_selection(window);
+        if switcher.moving(now) {
+            window.request_animation_frame();
+        }
+        let visibility = switcher.visibility.value(now);
+        let metrics = switcher.metrics(window);
+        let rows = switcher
+            .items
+            .chunks(metrics.columns)
+            .enumerate()
+            .map(|(row, items)| {
+                div()
+                    .flex()
+                    .gap(px(GAP))
+                    .h(px(CARD_HEIGHT))
+                    .flex_shrink_0()
+                    .children(items.iter().enumerate().map(|(column, item)| {
+                        let id = item.id;
+                        let index = row * metrics.columns + column;
+                        let selected = switcher.selected == index;
+                        let highlight = item.highlight.value(now);
+                        let accent: Hsla = rgb(0x718dab).into();
+                        let tint: Hsla = rgb(0xf6f8fb).into();
                         div()
                             .id(("switcher-card", id))
                             .debug_selector(move || format!("switcher-card-{id}"))
@@ -231,23 +258,24 @@ impl Workspace {
                             .gap(px(8.))
                             .rounded(px(10.))
                             .border_2()
-                            .border_color(if selected {
-                                rgb(0x718dab).into()
-                            } else {
-                                transparent_black()
+                            .border_color(accent.opacity(highlight))
+                            .bg(tint.opacity(highlight))
+                            .when(interactive, |view| {
+                                view.cursor_pointer()
+                                    .when(!selected, |view| {
+                                        view.hover(|style| style.bg(rgb(appearance::BACKGROUND)))
+                                    })
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(switcher) = &mut this.switcher {
+                                            switcher.select(index, cx.background_executor().now());
+                                        }
+                                        this.commit_switcher(window, cx);
+                                    }))
                             })
-                            .bg(rgb(if selected {
-                                0xf6f8fb
-                            } else {
-                                appearance::CHROME
-                            }))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(rgb(appearance::BACKGROUND)))
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.activate(id, window, cx);
-                            }))
                             .child(
                                 div()
                                     .relative()
@@ -263,45 +291,24 @@ impl Workspace {
                             )
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
                                     .w_full()
                                     .min_w_0()
                                     .h(px(20.))
-                                    .font_weight(if selected {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .truncate()
-                                            .child(self.tab_label(tab)),
-                                    )
-                                    .when(tab.dirty(cx), |view| {
-                                        view.child(
-                                            div()
-                                                .size(px(5.))
-                                                .rounded_full()
-                                                .flex_shrink_0()
-                                                .bg(rgb(appearance::MUTED)),
-                                        )
-                                    }),
-                            ),
-                    )
-                }))
-        });
+                                    .text_center()
+                                    .truncate()
+                                    .child(item.title.clone()),
+                            )
+                    }))
+            });
         let panel = div()
             .id("tab-switcher")
             .debug_selector(|| "tab-switcher".into())
+            .relative()
+            .top(px((1. - visibility) * 6.))
             .w(metrics.width)
             .h(metrics.height)
             .flex()
             .flex_col()
-            .gap(px(GAP))
             .p(px(PADDING))
             .rounded(px(16.))
             .bg(rgb(appearance::CHROME))
@@ -313,30 +320,9 @@ impl Workspace {
                 blur_radius: px(40.),
                 spread_radius: px(0.),
             }])
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .h(px(28.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Open documents"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(appearance::MUTED))
-                            .child(format!(
-                                "{} of {}",
-                                switcher.selected + 1,
-                                switcher.items.len()
-                            )),
-                    ),
-            )
+            .when(interactive, |view| {
+                view.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            })
             .child(
                 div()
                     .id("switcher-grid")
@@ -347,33 +333,10 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap(px(GAP))
-                    .overflow_y_scroll()
+                    .overflow_hidden()
+                    .when(interactive, |view| view.overflow_y_scroll())
                     .track_scroll(&switcher.scroll)
                     .children(rows),
-            )
-            .child(
-                div()
-                    .h(px(72.))
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .gap(px(3.))
-                    .text_size(px(12.))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_color(rgb(appearance::TEXT))
-                            .child(location),
-                    )
-                    .child(div().text_color(rgb(appearance::MUTED)).child(detail))
-                    .child(
-                        div()
-                            .mt(px(5.))
-                            .text_size(px(11.))
-                            .text_color(rgb(appearance::MUTED))
-                            .child("Release Control to open · ⇧Tab to go back · Esc to cancel"),
-                    ),
             );
         Some(
             div()
@@ -384,15 +347,18 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .bg(rgba(0x11111124))
-                .occlude()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.cancel_switcher(window, cx);
-                    }),
-                )
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                .opacity(visibility)
+                .when(interactive, |view| {
+                    view.occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.cancel_switcher(window, cx);
+                            }),
+                        )
+                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                })
                 .child(panel)
                 .into_any_element(),
         )
