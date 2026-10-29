@@ -4,10 +4,13 @@ mod autoformat;
 mod code_block;
 mod document;
 mod editor;
+mod extensions;
 mod inline;
 mod lists;
 mod projection;
+mod text_input;
 mod typing;
+pub use text_input::{TextInput, TextInputEvent};
 
 pub use document::Document;
 pub use editor::{
@@ -17,5 +20,5 @@ pub use editor::{
 };
 pub use editor::{EditorEvent, Format, MarkdownEditor, MarkdownPreview, init};
 
-mod text_input;
-pub use text_input::{TextInput, TextInputEvent};
+#[cfg(test)]
+mod extensions_tests;

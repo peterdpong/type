@@ -2,7 +2,7 @@
 pub const FONT_FAMILY: &str = ".SystemUIFont";
 pub const UI_SIZE: f32 = 13.;
 pub const BODY_SIZE: f32 = 15.;
-pub const TOP_GUTTER: f32 = 56.;
+pub const TOP_GUTTER: f32 = 40.;
 pub const BODY_LINE_HEIGHT: f32 = BODY_SIZE * 1.75;
 pub const PARAGRAPH_GAP: f32 = BODY_SIZE * 1.25;
 pub const CODE_SIZE: f32 = BODY_SIZE * 0.85;

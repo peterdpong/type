@@ -13,7 +13,7 @@ pub(super) fn bounds(line: &super::LaidLine) -> Bounds<Pixels> {
 
 pub(super) fn toggle(editor: &mut MarkdownEditor, offset: usize, cx: &mut Context<MarkdownEditor>) {
     if editor.document.toggle_checkbox(offset) {
-        editor.selecting = false;
+        super::selection::stop(editor);
         editor.changed(cx);
         editor.toolbelt_dismissed = true;
         editor.reveal_cursor = false;

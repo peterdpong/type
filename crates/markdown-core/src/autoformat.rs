@@ -1,6 +1,6 @@
 //! Undoable acceptance of inline syntax typed directly into the document.
 use crate::inline;
-use pulldown_cmark::{Event, Options, Tag};
+use pulldown_cmark::{Event, Tag};
 use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -10,16 +10,19 @@ enum Kind {
     Strike,
     Code,
     Link,
+    Extended,
+    Math,
 }
 
 fn spans(source: &str) -> Vec<(Kind, Range<usize>)> {
-    inline::events(source, Options::ENABLE_STRIKETHROUGH)
+    let mut spans = inline::events(source, crate::extensions::options())
         .filter_map(|(event, range)| {
             let kind = match event {
                 Event::Start(Tag::Strong) => Kind::Bold,
                 Event::Start(Tag::Emphasis) => Kind::Italic,
                 Event::Start(Tag::Strikethrough) => Kind::Strike,
                 Event::Code(_) => Kind::Code,
+                Event::InlineMath(_) => Kind::Math,
                 Event::Start(Tag::Link { .. })
                     if source[range.clone()].starts_with('[')
                         && source[range.clone()].contains("](") =>
@@ -30,14 +33,28 @@ fn spans(source: &str) -> Vec<(Kind, Range<usize>)> {
             };
             Some((kind, range))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if source.contains(['=', '^', '~']) {
+        let ext = crate::extensions::Extensions::new(
+            source,
+            &mut vec![false; source.len()],
+            &mut vec![crate::projection::Face::default(); source.len()],
+            &mut Vec::new(),
+        );
+        spans.extend(
+            ext.inline_styles
+                .into_iter()
+                .map(|range| (Kind::Extended, range)),
+        );
+    }
+    spans
 }
 
 pub(crate) fn is_closing_input(text: &str) -> bool {
     !text.is_empty()
         && text
             .bytes()
-            .all(|b| matches!(b, b'*' | b'_' | b'~' | b'`' | b')'))
+            .all(|b| matches!(b, b'*' | b'_' | b'~' | b'`' | b')' | b'=' | b'^' | b'$'))
 }
 
 /// Escape the completed span as literal Markdown, with the caret after it.
@@ -55,7 +72,7 @@ pub(crate) fn rejected(before: &str, after: &str, cursor: usize) -> Option<(Stri
         .min_by_key(|(_, range)| range.start)?;
     let mut escaped = Vec::new();
     match kind {
-        Kind::Bold | Kind::Italic | Kind::Strike => {
+        Kind::Bold | Kind::Italic | Kind::Strike | Kind::Extended => {
             let marker = after.as_bytes()[range.start];
             let width = after[range.clone()]
                 .bytes()
@@ -69,7 +86,7 @@ pub(crate) fn rejected(before: &str, after: &str, cursor: usize) -> Option<(Stri
             escaped.extend(range.start..range.start + width);
             escaped.extend(range.end - closing..range.end);
         }
-        Kind::Code => {
+        Kind::Code | Kind::Math => {
             escaped.extend(
                 after[range.clone()]
                     .bytes()

@@ -305,6 +305,24 @@ impl Document {
         let start = self.line_range(self.cursor()).start;
         let line = &self.text()[self.line_range(self.cursor())];
         let old = block_prefix(line).len();
+        let next_line =
+            self.line_range((self.line_range(self.cursor()).end + 1).min(self.text().len()));
+        let underline = self.text()[next_line.clone()].trim();
+        let setext = if old == 0
+            && !line.trim().is_empty()
+            && next_line.start > start
+            && !underline.is_empty()
+        {
+            if underline.bytes().all(|b| b == b'=') {
+                1
+            } else if underline.bytes().all(|b| b == b'-') {
+                2
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let list = lists::prefix(line);
         let indentation = list.as_ref().map_or("", |list| &line[..list.indent]);
         let target = lists::prefix(prefix);
@@ -320,6 +338,8 @@ impl Document {
                     && old == indentation.len() + prefix.len()
             }
         };
+        let same =
+            same || (setext > 0 && prefix.bytes().take_while(|b| *b == b'#').count() == setext);
         let replacement = if same {
             String::new()
         } else if lists::prefix(prefix).is_some() {
@@ -331,6 +351,12 @@ impl Document {
         let next = start + cursor.saturating_sub(start + old) + replacement.len();
         let new_column = lists::prefix(&replacement).map_or(0, |prefix| prefix.content_column);
         let mut edits = vec![(start..start + old, replacement)];
+        if setext > 0 {
+            edits.push((
+                self.line_range(self.cursor()).end..next_line.end,
+                String::new(),
+            ));
+        }
         if let Some(current) = list {
             let delta = new_column as isize - current.content_column as isize;
             if delta != 0
@@ -536,6 +562,16 @@ pub(crate) fn to_utf16(text: &str, offset: usize) -> usize {
 }
 
 pub(crate) fn block_prefix(line: &str) -> &str {
+    let mut quote = 0;
+    while line[quote..].starts_with('>') {
+        quote += 1;
+        if line[quote..].starts_with(' ') {
+            quote += 1;
+        }
+    }
+    if quote > 0 {
+        return &line[..quote];
+    }
     if let Some(prefix) = lists::prefix(line) {
         return &line[..prefix.content];
     }

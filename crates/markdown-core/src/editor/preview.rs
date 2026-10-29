@@ -1,4 +1,4 @@
-use super::{Projection, appearance, heading_text_run};
+use super::{Projection, appearance, heading_text_run, styled_line::StyledLine};
 use gpui::{prelude::*, *};
 use std::sync::Arc;
 
@@ -8,9 +8,13 @@ const MAX_BYTES: usize = 8192;
 struct PreviewLine {
     text: SharedString,
     runs: Vec<TextRun>,
+    scripts: Vec<i8>,
     heading: usize,
     code: bool,
-    quote: bool,
+    quote_depth: usize,
+    cell: Option<crate::extensions::Cell>,
+    picture: bool,
+    math: bool,
     marker: SharedString,
     depth: usize,
     checkbox: Option<bool>,
@@ -78,9 +82,18 @@ impl MarkdownPreview {
                 Some(PreviewLine {
                     text: line.text[..end].to_owned().into(),
                     runs,
+                    scripts: line
+                        .spans
+                        .iter()
+                        .take_while(|span| span.range.start < end)
+                        .map(|span| span.face.script)
+                        .collect(),
                     heading: line.heading,
                     code: line.code,
-                    quote: line.quote,
+                    quote_depth: line.quote_depth,
+                    cell: line.cell.clone(),
+                    picture: line.picture.is_some(),
+                    math: line.math,
                     marker: line.marker.clone().into(),
                     depth: line.list_depth.unwrap_or(0),
                     checkbox: line.checkbox.map(|c| c.checked),
@@ -95,11 +108,12 @@ impl MarkdownPreview {
 }
 
 struct Row {
-    line: WrappedLine,
+    line: StyledLine,
     origin: Point<Pixels>,
     height: Pixels,
     background: Option<Bounds<Pixels>>,
-    quote: Option<Bounds<Pixels>>,
+    quote: Vec<Bounds<Pixels>>,
+    cell: Option<(Bounds<Pixels>, bool)>,
     rule: Option<Bounds<Pixels>>,
     marker: Option<(ShapedLine, Point<Pixels>)>,
 }
@@ -108,7 +122,7 @@ impl RenderOnce for MarkdownPreview {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         canvas(
             move |bounds, window, _| {
-                let mut rows = Vec::new();
+                let mut rows: Vec<Row> = Vec::new();
                 if !bounds.intersects(&window.content_mask().bounds) {
                     return rows;
                 }
@@ -116,9 +130,27 @@ impl RenderOnce for MarkdownPreview {
                 let width = (bounds.size.width - px(24.)).max(px(1.));
                 let scale = f32::from(width) / appearance::CONTENT_WIDTH;
                 let mut y = bounds.top() + px(12.);
+                let mut table_row_start = (0, y);
                 for (index, line) in self.lines.iter().enumerate() {
-                    if y >= bounds.bottom() - px(8.) {
+                    if y >= bounds.bottom() - px(8.)
+                        && line.cell.as_ref().is_none_or(|c| c.column == 0)
+                    {
                         break;
+                    }
+                    if let Some(cell) = &line.cell {
+                        if cell.column == 0 {
+                            table_row_start = (rows.len(), y);
+                        }
+                        y = table_row_start.1 + px(8. * scale);
+                    }
+                    let picture = line
+                        .picture
+                        .then(|| Bounds::new(point(left, y), size(width, px(220. * scale))));
+                    if line.picture {
+                        y += px(228. * scale);
+                    }
+                    if line.math {
+                        y += px(8. * scale);
                     }
                     let heading = appearance::heading_style(line.heading);
                     if index > 0
@@ -128,6 +160,8 @@ impl RenderOnce for MarkdownPreview {
                     }
                     let font_size = px(if line.code {
                         appearance::CODE_SIZE
+                    } else if line.math {
+                        18.
                     } else {
                         heading.map_or(appearance::BODY_SIZE, |h| h.size)
                     } * scale);
@@ -138,15 +172,18 @@ impl RenderOnce for MarkdownPreview {
                     } * scale);
                     let indent = px(if line.code {
                         appearance::CODE_PADDING
-                    } else if line.quote {
-                        20.
+                    } else if line.quote_depth > 0 {
+                        20. * line.quote_depth as f32
                     } else if line.checkbox.is_some() || !line.marker.is_empty() {
                         24. + line.depth as f32 * 24.
                     } else {
                         0.
                     } * scale)
                     .min(width / 2.);
-                    let origin = point(left + indent, y);
+                    let indent = line.cell.as_ref().map_or(indent, |c| {
+                        width / c.columns as f32 * c.column + px(12. * scale)
+                    });
+                    let mut origin = point(left + indent, y);
                     let text_width = (width
                         - indent
                         - if line.code {
@@ -155,19 +192,29 @@ impl RenderOnce for MarkdownPreview {
                             px(0.)
                         })
                     .max(px(1.));
-                    let shape = window
-                        .text_system()
-                        .shape_text(
-                            line.text.clone(),
-                            font_size,
-                            &line.runs,
-                            Some(text_width),
-                            None,
-                        )
-                        .ok()
-                        .and_then(|lines| lines.into_iter().next())
-                        .unwrap_or_default();
+                    let text_width = line.cell.as_ref().map_or(text_width, |c| {
+                        (width / c.columns as f32 - px(24. * scale)).max(px(1.))
+                    });
+                    let shape = StyledLine::new(
+                        line.text.clone(),
+                        font_size,
+                        &line.runs,
+                        &line.scripts,
+                        text_width,
+                        window,
+                    )
+                    .unwrap_or_default();
                     let total = shape.size(height).height;
+                    let spare = (text_width - shape.size(height).width).max(px(0.));
+                    origin.x += if line.math {
+                        spare / 2.
+                    } else {
+                        line.cell.as_ref().map_or(px(0.), |c| match c.alignment {
+                            pulldown_cmark::Alignment::Center => spare / 2.,
+                            pulldown_cmark::Alignment::Right => spare,
+                            _ => px(0.),
+                        })
+                    };
                     let marker_text: SharedString = match line.checkbox {
                         Some(true) => "☑".into(),
                         Some(false) => "☐".into(),
@@ -189,28 +236,76 @@ impl RenderOnce for MarkdownPreview {
                         line: shape,
                         origin,
                         height,
-                        background: line
-                            .code
-                            .then(|| Bounds::new(point(left, y), size(width, total))),
-                        quote: line
-                            .quote
-                            .then(|| Bounds::new(point(left, y), size(px(0.7), total))),
+                        background: picture.or_else(|| {
+                            line.code
+                                .then(|| Bounds::new(point(left, y), size(width, total)))
+                        }),
+                        quote: (0..line.quote_depth)
+                            .map(|depth| {
+                                Bounds::new(
+                                    point(left + px(20. * scale) * depth, y),
+                                    size(px(0.7), total),
+                                )
+                            })
+                            .collect(),
+                        cell: line.cell.as_ref().map(|c| {
+                            (
+                                Bounds::new(
+                                    point(
+                                        left + width / c.columns as f32 * c.column,
+                                        table_row_start.1,
+                                    ),
+                                    size(width / c.columns as f32, total + px(16. * scale)),
+                                ),
+                                c.row == 0,
+                            )
+                        }),
                         rule: line.rule.then(|| {
                             Bounds::new(point(left, y + height / 2.), size(width, px(0.5)))
                         }),
                         marker,
                     });
                     y += total;
+                    if line.math {
+                        y += px(8. * scale);
+                    }
+                    if let Some(cell) = &line.cell
+                        && cell.column + 1 == cell.columns
+                    {
+                        let height = rows[table_row_start.0..]
+                            .iter()
+                            .filter_map(|r| r.cell.as_ref().map(|(b, _)| b.size.height))
+                            .max()
+                            .unwrap();
+                        for row in &mut rows[table_row_start.0..] {
+                            row.cell.as_mut().unwrap().0.size.height = height;
+                        }
+                        y = table_row_start.1 + height;
+                    }
                 }
                 rows
             },
             |bounds, rows, window, cx| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     for row in rows {
+                        if let Some((bounds, header)) = row.cell {
+                            window.paint_quad(
+                                fill(
+                                    bounds,
+                                    rgb(if header {
+                                        appearance::CHROME
+                                    } else {
+                                        appearance::BACKGROUND
+                                    }),
+                                )
+                                .border_widths(px(0.35))
+                                .border_color(rgb(appearance::BORDER)),
+                            );
+                        }
                         if let Some(background) = row.background {
                             window.paint_quad(fill(background, rgb(appearance::SUBTLE)));
                         }
-                        for rect in [row.quote, row.rule].into_iter().flatten() {
+                        for rect in row.quote.into_iter().chain(row.rule) {
                             window.paint_quad(fill(rect, rgb(appearance::BORDER)));
                         }
                         if let Some((marker, origin)) = row.marker {
@@ -224,14 +319,7 @@ impl RenderOnce for MarkdownPreview {
                             window,
                             cx,
                         );
-                        let _ = row.line.paint(
-                            row.origin,
-                            row.height,
-                            TextAlign::Left,
-                            None,
-                            window,
-                            cx,
-                        );
+                        let _ = row.line.paint(row.origin, row.height, window, cx);
                     }
                 });
             },

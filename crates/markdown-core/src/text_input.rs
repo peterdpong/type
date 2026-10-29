@@ -295,7 +295,7 @@ impl Render for TextInput {
         let id = self.id;
         let prepaint = cx.entity();
         let paint = cx.entity();
-        let view = div()
+        let mut view = div()
             .id(id)
             .debug_selector(move || id.into())
             .size_full()
@@ -377,6 +377,23 @@ impl Render for TextInput {
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.selecting = false),
             );
+        macro_rules! block { ($($action:ty),*) => { $(view = view.on_action(|_: &$action, _, cx| cx.stop_propagation());)* }; }
+        block!(
+            Bold,
+            Italic,
+            InlineCode,
+            Heading1,
+            Heading2,
+            Heading3,
+            Heading4,
+            Heading5,
+            Heading6,
+            BulletList,
+            OrderedList,
+            TaskList,
+            ToggleTask,
+            Quote
+        );
         view.child(
             canvas(
                 move |bounds, window, cx| {

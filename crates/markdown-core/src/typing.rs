@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, Options, Tag};
+use pulldown_cmark::{Event, Tag};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -37,7 +37,7 @@ struct Wrapper {
 }
 fn all_wrappers(source: &str) -> Vec<Wrapper> {
     let mut result = Vec::new();
-    for (event, range) in crate::inline::events(source, Options::empty()) {
+    for (event, range) in crate::inline::events(source, crate::extensions::options()) {
         let (count, style) = match event {
             Event::Start(Tag::Strong) => (
                 2,
@@ -109,10 +109,11 @@ pub(crate) fn boundary_edit(
         edits.push((span.range.start..span.content.start, marker.clone()));
         edits.push((span.content.end..span.range.end, marker));
     }
-    for (event, span) in crate::inline::events(source, Options::ENABLE_STRIKETHROUGH) {
+    for (event, span) in crate::inline::events(source, crate::extensions::options()) {
         if matches!(event, Event::Start(Tag::Strikethrough))
             && adjacent(&span)
             && !source[span.clone()].starts_with("~~")
+            && !crate::extensions::subscript_opener(source, span.start)
         {
             edits.push((span.start..span.start + 1, "~~".into()));
             edits.push((span.end - 1..span.end, "~~".into()));

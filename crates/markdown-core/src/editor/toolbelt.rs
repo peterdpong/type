@@ -31,7 +31,7 @@ fn position(
 ) -> Option<Point<Pixels>> {
     let left = viewport.left() + px(8.);
     let right = viewport.right() - px(8.) - size.width;
-    let top = viewport.top() + px(56.);
+    let top = viewport.top() + px(appearance::TOP_GUTTER);
     let bottom = viewport.bottom() - px(8.) - size.height;
     if right < left || bottom < top {
         return None;
@@ -86,6 +86,7 @@ pub(super) fn show(
     let line = &editor.projection.lines[first];
     let prefix = crate::document::block_prefix(&editor.document.text()[line.source.clone()]);
     let inline = first == last
+        && !editor.projection.editing_metadata
         && !line.code
         && !line.rule
         && selection.start >= line.source.start + prefix.len()

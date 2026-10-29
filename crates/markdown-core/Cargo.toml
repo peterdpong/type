@@ -8,6 +8,7 @@ license.workspace = true
 gpui.workspace = true
 pulldown-cmark.workspace = true
 unicode-segmentation.workspace = true
+unicode-linebreak = "0.1.5"
 regex = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -36,7 +36,7 @@ pub(crate) fn line_range(source: &str, offset: usize) -> Range<usize> {
     start..end
 }
 pub(crate) fn blocks(source: &str) -> Vec<CodeBlock> {
-    Parser::new(source)
+    Parser::new_ext(source, crate::extensions::options())
         .into_offset_iter()
         .filter_map(|(event, range)| {
             let Event::Start(Tag::CodeBlock(kind)) = event else {

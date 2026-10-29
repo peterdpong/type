@@ -62,15 +62,39 @@ impl Snapshot {
         for panel in &editor.code_panels {
             fill(panel.bounds, appearance::SUBTLE);
         }
+        for row in &editor.table_rows {
+            fill(
+                row.bounds,
+                if row.header {
+                    appearance::CHROME
+                } else {
+                    appearance::BACKGROUND
+                },
+            );
+            fill(
+                Bounds::new(row.bounds.origin, size(row.bounds.size.width, px(1.))),
+                appearance::BORDER,
+            );
+            let width = row.bounds.size.width / row.cells.len() as f32;
+            for column in 0..=row.cells.len() {
+                fill(
+                    Bounds::new(
+                        row.bounds.origin + point(width * column, px(0.)),
+                        size(px(1.), row.bounds.size.height),
+                    ),
+                    appearance::BORDER,
+                );
+            }
+        }
         for (line, projected) in editor.layout.iter().zip(&editor.projection.lines) {
             if line.origin.y + line.height < clip.top() || line.origin.y > clip.bottom() {
                 continue;
             }
-            if projected.quote {
+            for depth in 0..projected.quote_depth {
                 fill(
                     Bounds::new(
                         point(
-                            line.origin.x - px(appearance::BODY_SIZE * 1.25 + 2.),
+                            line.origin.x - px(appearance::BODY_SIZE * 1.25 + 2.) * (depth + 1),
                             line.origin.y,
                         ),
                         size(px(2.), line.height),
@@ -88,11 +112,19 @@ impl Snapshot {
                 );
             }
             for span in &projected.spans {
-                if span.face.code && !projected.code {
+                if (span.face.code || span.face.keyboard || span.face.highlight) && !projected.code
+                {
                     let source = projected.source_index(span.range.start)
                         ..projected.source_index(span.range.end);
                     for rect in line.selection_rects(projected, &source) {
-                        fill(rect, appearance::SUBTLE);
+                        fill(
+                            rect,
+                            if span.face.highlight {
+                                0xffecab
+                            } else {
+                                appearance::SUBTLE
+                            },
+                        );
                     }
                 }
             }
@@ -209,7 +241,8 @@ fn raster(snapshot: &Snapshot) -> Option<RgbaImage> {
     }
     context.set_text_matrix(&CGAffineTransform::new(1., 0., 0., 1., 0., 0.));
     for text in &snapshot.text {
-        let font = if text.face.code {
+        let font_size = number(text.size) * if text.face.script == 0 { 1. } else { 0.6 };
+        let font = if text.face.code || text.face.keyboard {
             new_from_name(
                 match (text.face.bold, text.face.italic) {
                     (false, false) => "Menlo",
@@ -217,11 +250,11 @@ fn raster(snapshot: &Snapshot) -> Option<RgbaImage> {
                     (false, true) => "Menlo-Italic",
                     (true, true) => "Menlo-BoldItalic",
                 },
-                number(text.size),
+                font_size,
             )
             .ok()?
         } else {
-            appearance::native_font(number(text.size), text.face.bold, text.face.italic)?
+            appearance::native_font(font_size, text.face.bold, text.face.italic)?
         };
         let mut attributed = CFMutableAttributedString::new();
         attributed.replace_str(&CFString::new(&text.value), CFRange::init(0, 0));
@@ -237,7 +270,10 @@ fn raster(snapshot: &Snapshot) -> Option<RgbaImage> {
         }
         let (r, g, b) = color(text.color);
         context.set_rgb_fill_color(r, g, b, 1.);
-        let local = text.origin - snapshot.region.origin;
+        let mut local = text.origin - snapshot.region.origin;
+        if text.face.script != 0 {
+            local.y += text.size * if text.face.script > 0 { -0.35 } else { 0.075 };
+        }
         context.set_text_position(number(local.x), logical_height - number(local.y));
         CTLine::new_with_attributed_string(attributed.as_concrete_TypeRef()).draw(&context);
     }

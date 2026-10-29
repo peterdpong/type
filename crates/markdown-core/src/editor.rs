@@ -7,9 +7,9 @@ use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
     FontWeight, GlobalElementId, InspectorElementId, KeyBinding, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, ScrollWheelEvent,
-    StrikethroughStyle, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WrappedLine, actions, div, fill, font, point, prelude::*, px, relative, rgb, rgba, size,
+    MouseButton, MouseDownEvent, Pixels, Point, ScrollWheelEvent, StrikethroughStyle, Style,
+    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, font, point,
+    prelude::*, px, relative, rgb, rgba, size,
 };
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -18,6 +18,10 @@ mod find;
 mod list_controls;
 mod outline;
 mod preview;
+mod selection;
+mod structures;
+mod styled_line;
+use styled_line::StyledLine;
 mod toolbelt;
 pub use preview::MarkdownPreview;
 
@@ -121,10 +125,15 @@ pub enum EditorEvent {
 pub struct MarkdownEditor {
     document: Document,
     projection: Projection,
+    document_path: Option<std::path::PathBuf>,
+    editing_metadata: Option<usize>,
+    table_rows: Vec<structures::TableRow>,
+    picture_panels: Vec<structures::PicturePanel>,
     find: find::State,
     focus: FocusHandle,
     marked: Option<Range<usize>>,
     selecting: bool,
+    drag_selection: selection::Drag,
     toolbelt_dismissed: bool,
     // GPUI 0.2's debug selector map retains removed elements across frames.
     #[cfg(test)]
@@ -152,7 +161,7 @@ impl Focusable for MarkdownEditor {
 
 #[derive(Clone)]
 struct LaidLine {
-    shape: WrappedLine,
+    shape: StyledLine,
     origin: Point<Pixels>,
     font_size: Pixels,
     baseline_offset: Pixels,
@@ -254,6 +263,7 @@ impl MarkdownEditor {
             focus: cx.focus_handle(),
             marked: None,
             selecting: false,
+            drag_selection: selection::Drag::default(),
             toolbelt_dismissed: false,
             #[cfg(test)]
             toolbelt_bounds: None,
@@ -266,6 +276,10 @@ impl MarkdownEditor {
             preferred_x: None,
             layout: Vec::new(),
             code_panels: Vec::new(),
+            document_path: None,
+            editing_metadata: None,
+            table_rows: Vec::new(),
+            picture_panels: Vec::new(),
             bounds: Bounds::default(),
             layout_dirty: true,
             layout_revision: 0,
@@ -281,7 +295,7 @@ impl MarkdownEditor {
     pub fn deactivate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         find::hide(self, cx);
         self.finish_composition(window, cx);
-        self.selecting = false;
+        selection::stop(self);
         self.toolbelt_dismissed = true;
         self.outline.collapse_immediately();
         self.outline.clear_backdrop(window);
@@ -294,6 +308,12 @@ impl MarkdownEditor {
         if self.marked.is_some() {
             self.unmark_text(window, cx);
         }
+    }
+
+    /// Resolve local image URLs relative to this document. File ownership stays with the host.
+    pub fn set_document_path(&mut self, path: Option<std::path::PathBuf>, cx: &mut Context<Self>) {
+        self.document_path = path;
+        cx.notify();
     }
 
     pub fn markdown(&self) -> &str {
@@ -365,9 +385,10 @@ impl MarkdownEditor {
     /// Replace the complete document and reset history, selection, composition, and scroll.
     pub fn set_markdown(&mut self, markdown: impl Into<String>, cx: &mut Context<Self>) {
         self.document = Document::new(markdown);
+        self.editing_metadata = None;
         self.caret_animation = caret::Caret::new(cx.background_executor().now());
         self.marked = None;
-        self.selecting = false;
+        selection::stop(self);
         self.outline.reset();
         self.scroll = px(0.);
         self.rebuild();
@@ -378,7 +399,13 @@ impl MarkdownEditor {
         self.changed(cx);
     }
     pub fn format(&mut self, format: Format, cx: &mut Context<Self>) {
-        if self.projection.lines[self.projection.line_for_source(self.document.cursor())].code {
+        let line = &self.projection.lines[self.projection.line_for_source(self.document.cursor())];
+        if self.editing_metadata.is_some()
+            || line.code
+            || line.math
+            || (line.cell.is_some()
+                && !matches!(format, Format::Bold | Format::Italic | Format::Code))
+        {
             return;
         }
         self.marked = None;
@@ -401,7 +428,15 @@ impl MarkdownEditor {
     }
     fn rebuild(&mut self) {
         self.layout_dirty = true;
-        self.projection = Projection::new(self.document.text(), self.marked.is_some());
+        self.projection = Projection::with_metadata_edit(
+            self.document.text(),
+            self.marked.is_some(),
+            self.editing_metadata.map(|_| self.document.cursor()),
+        );
+        self.editing_metadata = self
+            .projection
+            .editing_metadata
+            .then_some(self.document.cursor());
         self.find.refresh(&self.projection, self.document.cursor());
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
@@ -422,6 +457,9 @@ impl MarkdownEditor {
         self.outline.jumped_to = None;
         self.toolbelt_dismissed = false;
         self.document.move_to(index, extend);
+        if self.editing_metadata.is_some() {
+            self.rebuild();
+        }
         self.reveal_cursor = true;
         cx.emit(EditorEvent::SelectionChanged);
         cx.notify();
@@ -429,6 +467,25 @@ impl MarkdownEditor {
     fn hit_test(&self, point: Point<Pixels>) -> usize {
         if self.layout.is_empty() {
             return 0;
+        }
+        if let Some(row) = self
+            .table_rows
+            .iter()
+            .find(|row| row.bounds.top() <= point.y && point.y <= row.bounds.bottom())
+        {
+            let column = ((point.x - row.bounds.left())
+                / (row.bounds.size.width / row.cells.len() as f32))
+                .floor()
+                .max(0.) as usize;
+            let i = row.cells.start + column.min(row.cells.len() - 1);
+            return self.projection.lines[i].source_index(self.layout[i].index(point));
+        }
+        if let Some(panel) = self
+            .picture_panels
+            .iter()
+            .find(|panel| panel.bounds.contains(&point))
+        {
+            return self.projection.pictures[panel.picture].source.start;
         }
         let rows = self
             .code_panels
@@ -509,9 +566,7 @@ impl MarkdownEditor {
         if next.is_plain() {
             self.move_to(next.source.start, false, cx);
         } else {
-            let offset = next.code_block.map_or(next.source.start, |i| {
-                self.projection.blocks[i].source.start
-            });
+            let offset = self.projection.block_start(index);
             let eol = if self.document.text().contains("\r\n") {
                 "\r\n"
             } else {
@@ -571,7 +626,14 @@ impl MarkdownEditor {
             }
             return true;
         }
-        if !line.quote || next.is_some_and(|next| next.quote) {
+        if !line.quote
+            || next.is_some_and(|next| {
+                next.quote
+                    && self.document.text()[next.source.clone()]
+                        .trim_start()
+                        .starts_with('>')
+            })
+        {
             return false;
         }
         if let Some(next) = next {
@@ -584,7 +646,12 @@ impl MarkdownEditor {
                 }
             } else {
                 let after = (self.document.line_range(line.source.start).end + 1).min(end);
-                let addition = if next.is_plain() {
+                let addition = if next.is_plain()
+                    || (next.quote
+                        && !self.document.text()[next.source.clone()]
+                            .trim_start()
+                            .starts_with('>'))
+                {
                     eol.to_string()
                 } else {
                     format!("{eol}{eol}")
@@ -691,12 +758,12 @@ impl MarkdownEditor {
         }
         if !code && !range.is_empty() {
             range = self.projection.expand_escapes(range);
-            for marker in ["**", "__", "~~", "_", "*", "`", "~"] {
+            for marker in ["**", "__", "~~", "==", "^", "_", "*", "`", "~"] {
                 let n = marker.len();
                 if range.start >= n
                     && self.document.text()[..range.start].ends_with(marker)
                     && self.document.text()[range.end..].starts_with(marker)
-                    && (!matches!(marker, "~" | "*" | "**" | "_" | "__")
+                    && (!matches!(marker, "~" | "*" | "**" | "_" | "__" | "==" | "^")
                         || (self
                             .projection
                             .is_inline_marker(range.start - n..range.start)
@@ -705,6 +772,9 @@ impl MarkdownEditor {
                     range = range.start - n..range.end + n;
                 }
             }
+        }
+        if self.document.selection().is_empty() {
+            range = self.projection.protect_delete(range, forward);
         }
         if !range.is_empty() {
             self.document.input(range, "", true);
@@ -784,6 +854,7 @@ impl MarkdownEditor {
                         extend,
                         cx,
                     );
+                } else if structures::vertical(self, key == "down", extend, cx) {
                 } else if let Some((p, h)) = self.caret() {
                     if key == "down"
                         && !extend
@@ -824,9 +895,21 @@ impl MarkdownEditor {
                     cx,
                 );
             }
-            "backspace" => self.delete(false, cx),
-            "delete" => self.delete(true, cx),
+            "backspace" => {
+                if !structures::delete_boundary(self, false, cx) {
+                    self.delete(false, cx);
+                }
+            }
+            "delete" => {
+                if !structures::delete_boundary(self, true, cx) {
+                    self.delete(true, cx);
+                }
+            }
             "enter" => {
+                if structures::enter(self, command || modifiers.control, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 let line =
                     &self.projection.lines[self.projection.line_for_source(self.document.cursor())];
                 if extend && line.list_depth.is_some() && !line.code {
@@ -837,6 +920,10 @@ impl MarkdownEditor {
                 self.changed(cx);
             }
             "tab" if !command && !modifiers.control && !modifiers.alt => {
+                if structures::tab(self, extend, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 let code = self.projection.lines
                     [self.projection.line_for_source(self.document.cursor())]
                 .code;
@@ -875,6 +962,8 @@ impl MarkdownEditor {
     }
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            structures::prepare_current_cell(self, cx);
+            let text = structures::input_text(self, &self.document.selection(), &text);
             self.document.insert(&text);
             self.changed(cx);
         }
@@ -885,8 +974,31 @@ impl MarkdownEditor {
         window.focus(&self.focus);
         self.toolbelt_dismissed = false;
         self.selecting = true;
+        self.drag_selection = selection::Drag::default();
         self.preferred_x = None;
+        if let Some(cell) = structures::cell_at(self, event.position) {
+            structures::prepare_cell(self, cell, cx);
+        }
         let index = self.hit_test(event.position);
+        if event.modifiers.platform
+            && let Some(link) = self
+                .projection
+                .links
+                .iter()
+                .find(|link| link.source.contains(&index))
+        {
+            self.selecting = false;
+            if let Some(target) = link.target {
+                self.move_to(target, false, cx);
+            } else if ["https://", "http://", "mailto:"]
+                .iter()
+                .any(|prefix| link.destination.starts_with(prefix))
+            {
+                cx.open_url(&link.destination);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if event.click_count >= 3 {
             let line = self.document.line_range(index);
             self.document.select(line.start, line.end);
@@ -901,6 +1013,9 @@ impl MarkdownEditor {
             }
         } else {
             self.document.move_to(index, event.modifiers.shift);
+        }
+        if self.editing_metadata.is_some() {
+            self.rebuild();
         }
         cx.emit(EditorEvent::SelectionChanged);
         cx.notify();
@@ -953,13 +1068,18 @@ impl EntityInputHandler for MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         let composing = self.marked.is_some();
+        if !composing && range.is_none() {
+            structures::prepare_current_cell(self, cx);
+        }
         let range = range
             .map(|r| {
                 from_utf16(self.document.text(), r.start)..from_utf16(self.document.text(), r.end)
             })
             .or(self.marked.take())
             .unwrap_or(self.document.selection());
-        self.document.input(range, text, !composing);
+        let input = structures::input_text(self, &range, text);
+        self.document.input(range, &input, !composing);
+        self.editing_metadata = Some(self.document.cursor());
         self.marked = None;
         self.changed(cx);
     }
@@ -972,13 +1092,18 @@ impl EntityInputHandler for MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         let composing = self.marked.is_some();
+        if !composing && range.is_none() {
+            structures::prepare_current_cell(self, cx);
+        }
         let range = range
             .map(|r| {
                 from_utf16(self.document.text(), r.start)..from_utf16(self.document.text(), r.end)
             })
             .or(self.marked.take())
             .unwrap_or(self.document.selection());
-        self.document.compose(range, text, !composing);
+        let input = structures::input_text(self, &range, text);
+        self.document.compose(range, &input, !composing);
+        self.editing_metadata = Some(self.document.cursor());
         let start = self.document.cursor().saturating_sub(text.len());
         self.marked = (!text.is_empty()).then_some(start..start + text.len());
         if let Some(r) = selected {
@@ -1014,6 +1139,7 @@ impl EntityInputHandler for MarkdownEditor {
 
 impl Render for MarkdownEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        find::subscribe_input(self, window, cx);
         if self.focus_subscriptions.is_empty() {
             self.focus_subscriptions
                 .push(cx.on_release_in(window, |this, window, _| {
@@ -1025,15 +1151,20 @@ impl Render for MarkdownEditor {
                         .activity(cx.background_executor().now());
                     cx.notify();
                 }));
-            self.focus_subscriptions
-                .push(cx.observe_window_activation(window, |this, _, cx| {
+            self.focus_subscriptions.push(cx.observe_window_activation(
+                window,
+                |this, window, cx| {
+                    if !window.is_window_active() {
+                        selection::stop(this);
+                    }
                     this.caret_animation
                         .activity(cx.background_executor().now());
                     cx.notify();
-                }));
+                },
+            ));
             self.focus_subscriptions
                 .push(cx.on_blur(&self.focus, window, |this, _, cx| {
-                    this.selecting = false;
+                    selection::stop(this);
                     cx.notify();
                 }));
         }
@@ -1094,31 +1225,14 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(|this, _: &TaskList, _, cx| this.format(Format::TaskList, cx)))
             .on_action(cx.listener(|this, _: &ToggleTask, _, cx| {
                 let i = this.projection.line_for_source(this.document.cursor());
-                if let Some(checkbox) = this.projection.lines[i].checkbox {
+                if this.projection.lines[i].cell.is_some() {
+                    structures::enter(this, true, cx);
+                } else if let Some(checkbox) = this.projection.lines[i].checkbox {
                     list_controls::toggle(this, checkbox.offset, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &Quote, _, cx| this.format(Format::Quote, cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.selecting = false;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.selecting = false;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if this.selecting {
-                    this.move_to(this.hit_test(event.position), true, cx);
-                }
-            }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 this.caret_animation
                     .activity(cx.background_executor().now());
@@ -1127,6 +1241,7 @@ impl Render for MarkdownEditor {
                     - event.delta.pixel_delta(px(appearance::BODY_LINE_HEIGHT)).y)
                     .clamp(px(0.), this.max_scroll);
                 this.reveal_cursor = false;
+                selection::extend(this, cx);
                 cx.notify();
             }))
             .child(EditorSurface {
@@ -1182,6 +1297,7 @@ impl Element for EditorSurface {
                 && editor.bounds == bounds
                 && editor.layout_scroll == editor.scroll
             {
+                structures::show_pictures(editor, window, cx);
                 list_controls::show(editor, window, cx);
                 outline::show(editor, window, cx);
                 toolbelt::show(editor, window, cx);
@@ -1198,7 +1314,10 @@ impl Element for EditorSurface {
             let x = bounds.left() + ((bounds.size.width - width) / 2.).max(left_margin);
             let mut y = bounds.top() + px(editor.top_gutter() + 8.);
             let mut previous_content_bottom = None;
-            let mut layout = Vec::new();
+            let mut layout: Vec<LaidLine> = Vec::new();
+            let mut table_rows = Vec::new();
+            let mut picture_panels = Vec::new();
+            let mut table_row_start = (0, px(0.));
             let mut panels = Vec::new();
             let mut panel_start = (0, px(0.));
             let mut list_gutters = Vec::new();
@@ -1217,6 +1336,23 @@ impl Element for EditorSurface {
                 }
             }
             for (i, line) in editor.projection.lines.iter().enumerate() {
+                if let Some(cell) = &line.cell {
+                    if cell.column == 0 {
+                        table_row_start = (i, y);
+                    }
+                    y = table_row_start.1 + px(8.);
+                }
+                if let Some(picture) = line.picture {
+                    y += px(8.);
+                    picture_panels.push(structures::PicturePanel {
+                        bounds: Bounds::new(point(x, y), size(width, px(220.))),
+                        picture,
+                    });
+                    y += px(228.);
+                }
+                if line.math {
+                    y += px(8.);
+                }
                 let heading = appearance::heading_style(line.heading);
                 if let (Some(style), Some(bottom)) = (heading, previous_content_bottom) {
                     y = y.max(bottom + px(style.space_before));
@@ -1237,6 +1373,10 @@ impl Element for EditorSurface {
                 }
                 let font_size = if line.code {
                     appearance::CODE_SIZE
+                } else if line.math {
+                    18.
+                } else if line.picture.is_some() {
+                    appearance::UI_SIZE
                 } else {
                     heading.map_or(appearance::BODY_SIZE, |style| style.size)
                 };
@@ -1263,12 +1403,20 @@ impl Element for EditorSurface {
                     .min((width - px(64.)).max(px(0.)));
                 let indent = list_indent
                     + if line.quote {
-                        px(appearance::BODY_SIZE * 1.25 + 2.)
+                        (px(appearance::BODY_SIZE * 1.25 + 2.) * line.quote_depth)
+                            .min((width - list_indent - px(64.)).max(px(0.)))
                     } else if line.code {
                         px(appearance::CODE_PADDING)
                     } else {
                         px(0.)
                     };
+                let indent = if let Some(cell) = &line.cell {
+                    width / cell.columns as f32 * cell.column + px(12.)
+                } else if !line.marker.is_empty() && line.list_depth.is_none() {
+                    indent + px(28.)
+                } else {
+                    indent
+                };
                 let mut runs = Vec::new();
                 for span in &line.spans {
                     let mut run = heading_text_run(span.range.len(), span.face, line.heading);
@@ -1293,27 +1441,44 @@ impl Element for EditorSurface {
                     }
                     runs.push(run);
                 }
-                let text_width = width
-                    - indent
-                    - if line.code {
-                        px(appearance::CODE_PADDING)
-                    } else {
-                        px(0.)
-                    };
-                let shape = window
-                    .text_system()
-                    .shape_text(
-                        line.text.clone().into(),
-                        px(font_size),
-                        &runs,
-                        Some(text_width),
-                        None,
-                    )
-                    .expect("Markdown text shaping failed")
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
+                let text_width = if let Some(cell) = &line.cell {
+                    (width / cell.columns as f32 - px(24.)).max(px(8.))
+                } else {
+                    width
+                        - indent
+                        - if line.code {
+                            px(appearance::CODE_PADDING)
+                        } else {
+                            px(0.)
+                        }
+                };
+                let scripts = line
+                    .spans
+                    .iter()
+                    .map(|span| span.face.script)
+                    .collect::<Vec<_>>();
+                let shape = StyledLine::new(
+                    line.text.clone().into(),
+                    px(font_size),
+                    &runs,
+                    &scripts,
+                    text_width,
+                    window,
+                )
+                .expect("Markdown text shaping failed");
                 let total_height = shape.size(height).height;
+                let spare = (text_width - shape.size(height).width).max(px(0.));
+                let align = if line.math {
+                    spare / 2.
+                } else {
+                    line.cell
+                        .as_ref()
+                        .map_or(px(0.), |cell| match cell.alignment {
+                            pulldown_cmark::Alignment::Center => spare / 2.,
+                            pulldown_cmark::Alignment::Right => spare,
+                            _ => px(0.),
+                        })
+                };
                 // Empty native layouts have no glyph runs for font metrics.
                 let (ascent, descent) = if line.text.is_empty() {
                     let probe = window.text_system().shape_line(
@@ -1335,14 +1500,39 @@ impl Element for EditorSurface {
                 };
                 layout.push(LaidLine {
                     shape,
-                    origin: point(x + indent, y),
+                    origin: point(x + indent + align, y),
                     font_size: px(font_size),
                     baseline_offset: (height - ascent - descent) / 2. + ascent,
                     line_height: height,
                     height: total_height,
-                    width: text_width,
+                    width: text_width - align,
                 });
                 y += total_height;
+                if line.math {
+                    y += px(8.);
+                }
+                if let Some(cell) = &line.cell
+                    && cell.column + 1 == cell.columns
+                {
+                    let rows = table_row_start.0..i + 1;
+                    let height = layout[rows.clone()]
+                        .iter()
+                        .map(|line| line.height)
+                        .max()
+                        .unwrap();
+                    for line in &mut layout[rows.clone()] {
+                        line.height = height;
+                    }
+                    y = table_row_start.1 + height + px(16.);
+                    table_rows.push(structures::TableRow {
+                        bounds: Bounds::new(
+                            point(x, table_row_start.1),
+                            size(width, height + px(16.)),
+                        ),
+                        cells: rows,
+                        header: cell.row == 0,
+                    });
+                }
                 if !line.text.is_empty() || !line.is_plain() {
                     previous_content_bottom = Some(y);
                 }
@@ -1385,12 +1575,21 @@ impl Element for EditorSurface {
             for panel in &mut panels {
                 panel.bounds.origin.y -= editor.scroll;
             }
+            for row in &mut table_rows {
+                row.bounds.origin.y -= editor.scroll;
+            }
+            for picture in &mut picture_panels {
+                picture.bounds.origin.y -= editor.scroll;
+            }
+            editor.table_rows = table_rows;
+            editor.picture_panels = picture_panels;
             editor.layout = layout;
             editor.code_panels = panels;
             editor.bounds = bounds;
             editor.layout_dirty = false;
             editor.layout_revision = editor.layout_revision.wrapping_add(1);
             editor.layout_scroll = editor.scroll;
+            structures::show_pictures(editor, window, cx);
             list_controls::show(editor, window, cx);
             outline::show(editor, window, cx);
             toolbelt::show(editor, window, cx);
@@ -1407,6 +1606,7 @@ impl Element for EditorSurface {
         window: &mut Window,
         cx: &mut App,
     ) {
+        selection::listen(&self.editor, window);
         let editor = self.editor.read(cx);
         let focus = editor.focus.clone();
         window.handle_input(
@@ -1419,6 +1619,7 @@ impl Element for EditorSurface {
         let layout = editor.layout.clone();
         let projection = editor.projection.clone();
         let panels = editor.code_panels.clone();
+        let table_rows = editor.table_rows.clone();
         let empty = editor.document.text().is_empty();
         let max_scroll = editor.max_scroll;
         let scroll = editor.scroll;
@@ -1445,6 +1646,7 @@ impl Element for EditorSurface {
             Vec::new()
         };
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            structures::paint_tables(&table_rows, window);
             for panel in &panels {
                 if panel.bounds.bottom() >= bounds.top() && panel.bounds.top() <= bounds.bottom() {
                     window.paint_quad(
@@ -1460,11 +1662,11 @@ impl Element for EditorSurface {
                     continue;
                 }
                 let projected = &projection.lines[i];
-                if projected.quote {
+                for depth in 0..projected.quote_depth {
                     window.paint_quad(fill(
                         Bounds::new(
                             point(
-                                line.origin.x - px(appearance::BODY_SIZE * 1.25 + 2.),
+                                line.origin.x - px(appearance::BODY_SIZE * 1.25 + 2.) * (depth + 1),
                                 line.origin.y,
                             ),
                             size(px(2.), line.height),
@@ -1519,14 +1721,7 @@ impl Element for EditorSurface {
                         window.paint_quad(fill(rect, rgb(appearance::SELECTION)));
                     }
                 }
-                let _ = line.shape.paint(
-                    line.origin,
-                    line.line_height,
-                    TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
+                let _ = line.shape.paint(line.origin, line.line_height, window, cx);
             }
             if empty {
                 let run = TextRun {
@@ -1574,7 +1769,7 @@ fn heading_text_run(len: usize, face: Face, level: usize) -> TextRun {
 }
 
 fn text_run(len: usize, face: Face) -> TextRun {
-    let mut font = font(if face.code {
+    let mut font = font(if face.code || face.keyboard {
         "Menlo"
     } else {
         appearance::FONT_FAMILY
@@ -1589,8 +1784,12 @@ fn text_run(len: usize, face: Face) -> TextRun {
         len,
         font,
         color: rgb(appearance::TEXT).into(),
-        background_color: face.code.then(|| rgb(appearance::SUBTLE).into()),
-        underline: face.link.then_some(UnderlineStyle {
+        background_color: if face.highlight {
+            Some(rgb(0xffecab).into())
+        } else {
+            (face.code || face.keyboard).then(|| rgb(appearance::SUBTLE).into())
+        },
+        underline: (face.link && face.script == 0).then_some(UnderlineStyle {
             color: Some(rgb(appearance::MUTED).into()),
             thickness: px(1.),
             wavy: false,
@@ -1716,6 +1915,43 @@ mod tests {
         for level in 3..=6 {
             cx.simulate_keystrokes(&format!("{command}-alt-{level}"));
             editor.read_with(cx, |e, _| assert_eq!(e.markdown(), code));
+        }
+    }
+
+    #[gpui::test]
+    fn heading_styling_waits_for_a_space_after_the_markers(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "");
+        for level in 1..=6 {
+            editor.update_in(cx, |e, _, cx| e.set_markdown("", cx));
+            for count in 1..=level {
+                cx.simulate_input("#");
+                editor.read_with(cx, |e, _| {
+                    assert_eq!(e.projection.lines[0].heading, 0);
+                    assert_eq!(e.projection.lines[0].text, "#".repeat(count));
+                    assert_eq!(e.layout[0].font_size, px(appearance::BODY_SIZE));
+                    assert!(!e.outline.has_headings);
+                });
+            }
+            cx.simulate_input(" ");
+            editor.read_with(cx, |e, _| {
+                assert_eq!(e.markdown(), format!("{} ", "#".repeat(level)));
+                assert_eq!(e.projection.lines[0].heading, level);
+                assert!(e.projection.lines[0].text.is_empty());
+                assert_eq!(e.document.cursor(), level + 1);
+            });
+            cx.dispatch_action(Undo);
+            editor.read_with(cx, |e, _| {
+                assert_eq!(e.markdown(), "#".repeat(level));
+                assert_eq!(e.projection.lines[0].text, "#".repeat(level));
+                assert_eq!(e.projection.lines[0].heading, 0);
+                assert!(!e.outline.has_headings);
+            });
+            cx.dispatch_action(Redo);
+            cx.simulate_input("Héllø");
+            editor.read_with(cx, |e, _| {
+                assert_eq!(e.projection.lines[0].heading, level);
+                assert_eq!(e.projection.lines[0].text, "Héllø");
+            });
         }
     }
 

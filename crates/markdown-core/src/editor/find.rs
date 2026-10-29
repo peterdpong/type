@@ -22,13 +22,13 @@ pub(super) struct State {
     case_sensitive: bool,
     pattern: Option<Regex>,
     input: Entity<input::Input>,
+    subscription: Option<Subscription>,
     pub(super) focus: FocusHandle,
 }
 
 impl State {
     pub fn new(cx: &mut Context<MarkdownEditor>) -> Self {
-        let parent = cx.weak_entity();
-        let input = cx.new(|cx| input::Input::new(parent, cx));
+        let input = cx.new(|cx| input::Input::new("find-input", "Find in document", cx));
         let focus = input.read(cx).focus.clone();
         Self {
             open: false,
@@ -39,6 +39,7 @@ impl State {
             case_sensitive: false,
             pattern: None,
             input,
+            subscription: None,
             focus,
         }
     }
@@ -85,6 +86,26 @@ impl State {
     }
 }
 
+pub(super) fn subscribe_input(
+    editor: &mut MarkdownEditor,
+    window: &Window,
+    cx: &mut Context<MarkdownEditor>,
+) {
+    if editor.find.subscription.is_none() {
+        editor.find.subscription = Some(cx.subscribe_in(
+            &editor.find.input,
+            window,
+            |editor, _, event: &crate::TextInputEvent, window, cx| match event {
+                crate::TextInputEvent::Changed(query) => query_changed(editor, query.clone(), cx),
+                crate::TextInputEvent::Submit { backwards }
+                | crate::TextInputEvent::Step { backwards } => step(editor, *backwards, window, cx),
+                crate::TextInputEvent::Cancel => close(editor, window, cx),
+                crate::TextInputEvent::Blur => {}
+            },
+        ));
+    }
+}
+
 pub(super) fn open(
     editor: &mut MarkdownEditor,
     window: &mut Window,
@@ -109,11 +130,10 @@ pub(super) fn open(
         editor.layout_dirty = true;
         cx.emit(EditorEvent::FindVisibilityChanged);
     }
-    editor
-        .find
-        .input
-        .update(cx, |input, cx| input.select_query(&editor.find.query, cx));
-    editor.selecting = false;
+    editor.find.input.update(cx, |input, cx| {
+        input.set_text(&editor.find.query, 0..editor.find.query.len(), cx)
+    });
+    super::selection::stop(editor);
     editor.toolbelt_dismissed = true;
     editor.reveal_cursor = false;
     editor.find.reveal = editor.find.active.is_some();
@@ -273,7 +293,7 @@ pub(super) fn render(
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|editor, _, _, cx| {
-                    editor.selecting = false;
+                    super::selection::stop(editor);
                     cx.stop_propagation();
                 }),
             )

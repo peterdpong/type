@@ -166,7 +166,7 @@ fn jump(
             .clamp(px(0.), editor.max_scroll);
     let cursor = editor.projection.lines[index].source_index(0);
     editor.move_to(cursor, false, cx);
-    editor.selecting = false;
+    super::selection::stop(editor);
     editor.preferred_x = None;
     editor.toolbelt_dismissed = true;
     editor.reveal_cursor = false;
@@ -664,7 +664,10 @@ mod tests {
         editor.update_in(cx, |editor, window, _| {
             let entries = headings(editor);
             assert_eq!(editor.document.cursor(), entries[1].source + 4);
-            assert_eq!(editor.layout[entries[1].line].origin.y, px(64.));
+            assert_eq!(
+                editor.layout[entries[1].line].origin.y,
+                px(appearance::TOP_GUTTER + 8.),
+            );
             assert_eq!(editor.outline.active, Some(entries[1].source));
             assert_eq!(editor.markdown(), source);
             assert!(editor.focus.is_focused(window));
@@ -699,7 +702,7 @@ mod tests {
             let entries = headings(editor);
             assert_eq!(editor.outline.active, Some(0));
             (
-                editor.layout[entries[1].line].origin.y - px(64.),
+                editor.layout[entries[1].line].origin.y - px(appearance::TOP_GUTTER + 8.),
                 entries[1].source,
             )
         });

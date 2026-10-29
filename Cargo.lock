@@ -3153,6 +3153,7 @@ dependencies = [
  "image",
  "pulldown-cmark",
  "regex",
+ "unicode-linebreak",
  "unicode-segmentation",
 ]
 

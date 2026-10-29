@@ -184,32 +184,84 @@ impl Caret {
     }
 }
 
+pub(crate) fn font_stroke(text: &TextSystem, font: FontId, font_size: Pixels) -> Bounds<Pixels> {
+    ['S', 'g', 'i']
+        .into_iter()
+        .filter_map(|ch| text.typographic_bounds(font, font_size, ch).ok())
+        .reduce(|a, b| a.union(&b))
+        .filter(|bounds| bounds.size.height > px(0.))
+        .unwrap_or_else(|| {
+            let cap = text.cap_height(font, font_size);
+            let cap = if cap > px(0.) { cap } else { font_size };
+            let descent = text.descent(font, font_size).abs();
+            Bounds::new(point(px(0.), -descent), size(px(WIDTH), cap + descent))
+        })
+}
+
+pub(crate) fn bounds_from_glyph(
+    baseline: Point<Pixels>,
+    glyph: Bounds<Pixels>,
+    font_size: Pixels,
+    script: i8,
+) -> Bounds<Pixels> {
+    let shift = font_size * super::styled_line::script_metrics(script).1;
+    // Font coordinates use y up; editor coordinates use y down.
+    Bounds::new(
+        baseline + point(px(-WIDTH), -glyph.bottom() + shift),
+        size(px(WIDTH), glyph.size.height),
+    )
+}
+
 fn target(editor: &MarkdownEditor, window: &Window) -> Option<Bounds<Pixels>> {
     let cursor = editor.document.cursor();
     let index = editor.projection.line_for_source(cursor);
     let line = editor.layout.get(index)?;
     let projected = &editor.projection.lines[index];
     let style = editor.document.typing_style();
+    let inherited = projected
+        .spans
+        .iter()
+        .find(|span| {
+            let start = projected.source_index(span.range.start);
+            let last = projected.text[..span.range.end]
+                .char_indices()
+                .next_back()
+                .map_or(span.range.start, |(i, _)| i);
+            let last = projected.source_index(last);
+            let end = last
+                + editor.markdown()[last..]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+            start <= cursor && cursor <= end
+        })
+        .map_or(Face::default(), |span| span.face);
     let face = Face {
+        script: inherited.script,
+        keyboard: inherited.keyboard,
         bold: style.bold,
         italic: style.italic,
         code: projected.code || style.code,
         ..Default::default()
     };
     let text = window.text_system();
-    let font = text.resolve_font(&heading_text_run(0, face, projected.heading).font);
-    let cap_height = text.cap_height(font, line.font_size);
-    let cap_height = if cap_height > px(0.) {
-        cap_height
-    } else {
-        line.font_size
+    let base_face = Face {
+        script: 0,
+        code: face.code,
+        keyboard: face.keyboard,
+        ..face
     };
-    // Font descent is signed on some platforms.
-    let descent = text.descent(font, line.font_size).abs();
+    let font = text.resolve_font(&heading_text_run(0, base_face, projected.heading).font);
     let position = line.position(projected.display_index(cursor));
-    Some(Bounds::new(
-        position + point(px(-WIDTH), line.baseline_offset - cap_height),
-        size(px(WIDTH), cap_height + descent),
+    Some(bounds_from_glyph(
+        position + point(px(0.), line.baseline_offset),
+        font_stroke(
+            text,
+            font,
+            line.font_size * super::styled_line::script_metrics(face.script).0,
+        ),
+        line.font_size,
+        face.script,
     ))
 }
 
@@ -240,38 +292,6 @@ pub(super) fn prepare(
         window.request_animation_frame();
     }
     visual.map(|visual| visual.snap_to_pixels(window.scale_factor()))
-}
-
-pub(crate) fn font_stroke(text: &TextSystem, font: FontId, font_size: Pixels) -> Bounds<Pixels> {
-    ['S', 'g', 'i']
-        .into_iter()
-        .filter_map(|ch| text.typographic_bounds(font, font_size, ch).ok())
-        .reduce(|a, b| a.union(&b))
-        .filter(|bounds| bounds.size.height > px(0.))
-        .unwrap_or_else(|| {
-            let cap = text.cap_height(font, font_size);
-            let cap = if cap > px(0.) { cap } else { font_size };
-            let descent = text.descent(font, font_size).abs();
-            Bounds::new(point(px(0.), -descent), size(px(WIDTH), cap + descent))
-        })
-}
-
-pub(crate) fn bounds_from_glyph(
-    baseline: Point<Pixels>,
-    glyph: Bounds<Pixels>,
-    font_size: Pixels,
-    script: i8,
-) -> Bounds<Pixels> {
-    let (scale, shift) = match script {
-        0 => (1., px(0.)),
-        n if n > 0 => (0.6, font_size * -0.35),
-        _ => (0.6, font_size * 0.075),
-    };
-    // Font coordinates use y up; editor coordinates use y down.
-    Bounds::new(
-        baseline + point(px(-WIDTH), -glyph.bottom() * scale + shift),
-        size(px(WIDTH), glyph.size.height * scale),
-    )
 }
 
 #[cfg(test)]
@@ -393,10 +413,11 @@ mod tests {
             let baseline = row.origin.y
                 + (row.line_height - placeholder.ascent - placeholder.descent) / 2.
                 + placeholder.ascent;
-            assert!((empty.top() + text.cap_height(font, font_size) - baseline).abs() < px(0.001));
-            assert!(
-                (empty.bottom() - baseline - text.descent(font, font_size).abs()).abs() < px(0.001)
-            );
+            let capital = text.typographic_bounds(font, font_size, 'S').unwrap();
+            let descender = text.typographic_bounds(font, font_size, 'g').unwrap();
+            let stroke = capital.union(&descender);
+            assert!((empty.top() + stroke.bottom() - baseline).abs() < px(0.001));
+            assert!((empty.bottom() + stroke.top() - baseline).abs() < px(0.001));
         });
         cx.simulate_input("Start");
         advance(cx, MOVE);
@@ -609,4 +630,28 @@ mod tests {
             assert!(editor.caret_animation.timer.is_none());
         });
     }
+    #[gpui::test]
+    fn script_caret_changes_size_only_inside_the_markers(cx: &mut TestAppContext) {
+        cx.update(init);
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            let editor = MarkdownEditor::new("x^hello^", cx);
+            window.focus(&editor.focus);
+            editor
+        });
+        let mut bounds = Vec::new();
+        for cursor in [1, 2, 7, 8] {
+            bounds.push(editor.update_in(cx, |editor, window, cx| {
+                editor.document.move_to(cursor, false);
+                editor.changed(cx);
+                target(editor, window).unwrap()
+            }));
+        }
+        assert_eq!(bounds[0].size.height, bounds[3].size.height);
+        assert_eq!(bounds[1].size.height, bounds[2].size.height);
+        assert!(bounds[1].size.height < bounds[0].size.height);
+        assert!(bounds[1].bottom() < bounds[0].bottom());
+    }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_tests;

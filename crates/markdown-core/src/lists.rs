@@ -1,5 +1,5 @@
 //! List structure and source-preserving edits shared by projection and input.
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +133,7 @@ pub(crate) fn items(source: &str) -> Vec<Item> {
     let mut lists = Vec::new();
     let mut parents = Vec::new();
     let mut items = Vec::new();
-    for (event, range) in Parser::new_ext(source, Options::ENABLE_TASKLISTS).into_offset_iter() {
+    for (event, range) in Parser::new_ext(source, crate::extensions::options()).into_offset_iter() {
         match event {
             Event::Start(Tag::List(number)) => lists.push(number),
             Event::End(TagEnd::List(_)) => {

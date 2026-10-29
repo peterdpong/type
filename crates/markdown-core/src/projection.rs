@@ -1,9 +1,10 @@
+use crate::extensions::{self, Cell, Extensions, Link, Picture, Table};
 use crate::{
     code_block::{self, CodeBlock},
     document::block_prefix,
     lists::{self, Checkbox},
 };
-use pulldown_cmark::{Event, Options, Tag};
+use pulldown_cmark::{Event, Tag};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -13,6 +14,9 @@ pub(crate) struct Face {
     pub code: bool,
     pub strike: bool,
     pub link: bool,
+    pub highlight: bool,
+    pub keyboard: bool,
+    pub script: i8,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct Span {
@@ -27,6 +31,11 @@ pub(crate) struct Line {
     pub spans: Vec<Span>,
     pub heading: usize,
     pub quote: bool,
+    pub quote_depth: usize,
+    pub cell: Option<Cell>,
+    pub picture: Option<usize>,
+    pub math: bool,
+    pub virtual_after: bool,
     pub code: bool,
     pub marker: String,
     pub list_depth: Option<usize>,
@@ -36,7 +45,10 @@ pub(crate) struct Line {
 }
 impl Line {
     pub fn is_plain(&self) -> bool {
-        !self.code
+        self.cell.is_none()
+            && self.picture.is_none()
+            && !self.math
+            && !self.code
             && !self.quote
             && self.heading == 0
             && self.list_depth.is_none()
@@ -51,6 +63,11 @@ impl Line {
             spans: Vec::new(),
             heading: 0,
             quote: false,
+            quote_depth: 0,
+            cell: None,
+            picture: None,
+            math: false,
+            virtual_after: false,
             code: code_block.is_some(),
             marker: String::new(),
             list_depth: None,
@@ -78,12 +95,22 @@ impl Line {
 #[derive(Clone, Debug)]
 pub(crate) struct Projection {
     pub lines: Vec<Line>,
+    pub editing_metadata: bool,
     pub blocks: Vec<CodeBlock>,
+    pub tables: Vec<Table>,
+    pub math_blocks: Vec<Range<usize>>,
+    pub pictures: Vec<Picture>,
+    pub links: Vec<Link>,
     inline_markers: Vec<Range<usize>>,
     escapes: Vec<Range<usize>>,
+    atomic: Vec<Range<usize>>,
+    protected: Vec<Range<usize>>,
 }
 impl Projection {
     pub fn new(source: &str, raw: bool) -> Self {
+        Self::with_metadata_edit(source, raw, None)
+    }
+    pub fn with_metadata_edit(source: &str, raw: bool, editing: Option<usize>) -> Self {
         let mut hidden = vec![false; source.len()];
         let mut faces = vec![Face::default(); source.len()];
         let code_blocks = code_block::blocks(source);
@@ -95,11 +122,23 @@ impl Projection {
         let mut rules = Vec::new();
         let mut inline_markers = Vec::new();
         let mut escapes = Vec::new();
+        let mut extensions = if raw {
+            Extensions::default()
+        } else {
+            Extensions::new(source, &mut hidden, &mut faces, &mut inline_markers)
+        };
+        let mut editing_metadata = false;
+        if let Some(cursor) = editing {
+            for range in &extensions.metadata {
+                if range.start <= cursor && cursor <= range.end {
+                    hidden[range.clone()].fill(false);
+                    extensions.skipped.retain(|r| r != range);
+                    editing_metadata = true;
+                }
+            }
+        }
         if !raw {
-            for (event, range) in crate::inline::events(
-                source,
-                Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
-            ) {
+            for (event, range) in crate::inline::events(source, extensions::options()) {
                 let slice = &source[range.clone()];
                 match event {
                     Event::Start(Tag::Strong) => {
@@ -116,23 +155,22 @@ impl Projection {
                     }
                     Event::Start(Tag::Strikethrough) => {
                         for face in &mut faces[range.clone()] {
-                            face.strike = true;
+                            face.strike = face.script != -1;
                         }
                         let width = if slice.starts_with("~~") { 2 } else { 1 };
                         hide_pair(&mut hidden, &mut inline_markers, range, width);
                     }
-                    Event::Start(Tag::Link { .. }) if slice.starts_with('[') => {
-                        if let Some(end) = slice.rfind("](") {
-                            hidden[range.start] = true;
-                            hidden[range.start + end..range.end].fill(true);
-                            inline_markers.push(range.start..range.start + 1);
-                            inline_markers.push(range.start + end..range.end);
-                            for face in &mut faces[range.start + 1..range.start + end] {
-                                face.link = true;
+                    Event::Code(_) => {
+                        if extensions
+                            .tables
+                            .iter()
+                            .any(|table| table.source.contains(&range.start))
+                        {
+                            for (i, _) in slice.match_indices("\\|") {
+                                hidden[range.start + i] = true;
+                                escapes.push(range.start + i..range.start + i + 2);
                             }
                         }
-                    }
-                    Event::Code(_) => {
                         let ticks = slice.bytes().take_while(|b| *b == b'`').count();
                         for face in &mut faces[range.clone()] {
                             face.code = true;
@@ -172,6 +210,10 @@ impl Projection {
             let end = start + raw_line.len();
             let content = raw_line.strip_suffix('\r').unwrap_or(raw_line);
             let source_range = start..end;
+            if extensions.skip_line(&(start..start + content.len())) {
+                start = end + 1;
+                continue;
+            }
             if let Some((index, block)) = code_blocks
                 .iter()
                 .enumerate()
@@ -205,10 +247,29 @@ impl Projection {
             } else {
                 block_prefix(content)
             };
-            let heading = prefix.bytes().take_while(|b| *b == b'#').count();
-            let quote = prefix.starts_with('>');
+            let heading = extensions
+                .headings
+                .iter()
+                .find(|(r, _)| r.start <= end && start < r.end)
+                .map_or(0, |(_, level)| *level);
+            let quote_depth = extensions
+                .quotes
+                .iter()
+                .filter(|r| r.start <= end && start < r.end)
+                .count();
+            let quote = quote_depth > 0;
+            let math = extensions
+                .math
+                .iter()
+                .any(|r| r.start <= end && start < r.end);
             let rule = rules.iter().any(|r| r.start == start);
-            let marker = if let Some(checkbox) = checkbox {
+            let marker = if let Some((_, number, _)) = extensions
+                .footnotes
+                .iter()
+                .find(|(r, _, _)| start <= r.start && r.start <= end)
+            {
+                format!("{number}.")
+            } else if let Some(checkbox) = checkbox {
                 if checkbox.checked { "☑" } else { "☐" }.to_string()
             } else if let Some(item) = first {
                 item.number.map_or_else(
@@ -243,67 +304,84 @@ impl Projection {
             {
                 hidden[start..start + 4].fill(true);
             }
-            let mut text = String::new();
-            let mut map = Vec::new();
-            let mut spans: Vec<Span> = Vec::new();
-            let mut last_end = structural_end;
-            for (i, ch) in content.char_indices() {
-                let source_index = start + i;
-                if hidden[source_index] {
-                    continue;
-                }
-                let display = text.len();
-                if (code && ch == '\t')
-                    || partial_tab.is_some_and(|(offset, _)| offset == source_index)
-                {
-                    let spaces = partial_tab
-                        .filter(|(offset, _)| *offset == source_index)
-                        .map_or_else(|| 4 - text.chars().count() % 4, |(_, spaces)| spaces);
-                    text.extend(std::iter::repeat_n(' ', spaces));
-                    map.extend(std::iter::repeat_n(source_index, spaces));
-                } else {
-                    text.push(ch);
-                    let mapped = escapes
-                        .binary_search_by_key(&(source_index + 1), |range| range.end)
-                        .map_or(source_index, |index| escapes[index].start);
-                    for byte in 0..ch.len_utf8() {
-                        map.push(mapped + byte);
+            for part in extensions.parts(source_range.clone()) {
+                let mut text = String::new();
+                let mut map = Vec::new();
+                let mut spans: Vec<Span> = Vec::new();
+                let mut last_end = structural_end.clamp(part.source.start, part.source.end);
+                let part_content =
+                    &source[part.source.start..part.source.end.min(start + content.len())];
+                for (i, ch) in part_content.char_indices() {
+                    let source_index = part.source.start + i;
+                    let replacement = extensions
+                        .replacements
+                        .binary_search_by_key(&source_index, |r| r.source.start)
+                        .ok()
+                        .map(|index| &extensions.replacements[index]);
+                    if hidden[source_index] && replacement.is_none() {
+                        continue;
+                    }
+                    let display = text.len();
+                    if let Some(replacement) = replacement {
+                        text.push_str(&replacement.text);
+                        map.extend(std::iter::repeat_n(source_index, replacement.text.len()));
+                    } else if (code && ch == '\t')
+                        || partial_tab.is_some_and(|(offset, _)| offset == source_index)
+                    {
+                        let spaces = partial_tab
+                            .filter(|(offset, _)| *offset == source_index)
+                            .map_or_else(|| 4 - text.chars().count() % 4, |(_, spaces)| spaces);
+                        text.extend(std::iter::repeat_n(' ', spaces));
+                        map.extend(std::iter::repeat_n(source_index, spaces));
+                    } else {
+                        text.push(ch);
+                        let mapped = escapes
+                            .binary_search_by_key(&(source_index + 1), |range| range.end)
+                            .map_or(source_index, |index| escapes[index].start);
+                        for byte in 0..ch.len_utf8() {
+                            map.push(mapped + byte);
+                        }
+                    }
+                    last_end = replacement.map_or(source_index + ch.len_utf8(), |r| r.source.end);
+                    let mut face = if code {
+                        Face {
+                            code: true,
+                            ..Default::default()
+                        }
+                    } else {
+                        faces[source_index]
+                    };
+                    face.strike |= checkbox.is_some_and(|checkbox| checkbox.checked);
+                    if let Some(span) = spans.last_mut().filter(|span| span.face == face) {
+                        span.range.end = text.len();
+                    } else {
+                        spans.push(Span {
+                            range: display..text.len(),
+                            face,
+                        });
                     }
                 }
-                last_end = source_index + ch.len_utf8();
-                let mut face = if code {
-                    Face {
-                        code: true,
-                        ..Default::default()
-                    }
-                } else {
-                    faces[source_index]
-                };
-                face.strike |= checkbox.is_some_and(|checkbox| checkbox.checked);
-                if let Some(span) = spans.last_mut().filter(|span| span.face == face) {
-                    span.range.end = text.len();
-                } else {
-                    spans.push(Span {
-                        range: display..text.len(),
-                        face,
-                    });
-                }
+                map.push(last_end);
+                lines.push(Line {
+                    source: part.source,
+                    text,
+                    map,
+                    spans,
+                    heading,
+                    quote,
+                    quote_depth,
+                    cell: part.cell,
+                    picture: part.picture,
+                    math,
+                    virtual_after: false,
+                    code,
+                    marker: marker.clone(),
+                    list_depth,
+                    checkbox,
+                    rule,
+                    code_block: block_index,
+                });
             }
-            map.push(last_end);
-            lines.push(Line {
-                source: source_range,
-                text,
-                map,
-                spans,
-                heading,
-                quote,
-                code,
-                marker,
-                list_depth,
-                checkbox,
-                rule,
-                code_block: block_index,
-            });
             start = end + 1;
         }
         if code_blocks.last().is_some_and(|block| {
@@ -314,19 +392,55 @@ impl Projection {
         }) {
             lines.push(Line::empty(source.len(), None));
         }
-        if lines.is_empty() {
-            lines.push(Line::empty(0, None));
+        let last_start = source.rfind('\n').map_or(0, |i| i + 1);
+        if lines.is_empty()
+            || (!source.ends_with('\n')
+                && extensions.skip_line(&(last_start..source.len()))
+                && !extensions
+                    .tables
+                    .iter()
+                    .any(|table| table.source.end == source.len())
+                && !extensions
+                    .headings
+                    .iter()
+                    .any(|(range, _)| range.end == source.len()))
+        {
+            let mut line = Line::empty(source.len(), None);
+            line.virtual_after = !source.is_empty();
+            lines.push(line);
         }
         Self {
             lines,
+            editing_metadata,
             blocks: code_blocks,
+            tables: extensions.tables,
+            math_blocks: extensions.math,
+            pictures: extensions.pictures,
+            links: extensions.links,
             inline_markers,
             escapes,
+            atomic: extensions
+                .replacements
+                .iter()
+                .map(|r| r.source.clone())
+                .collect(),
+            protected: extensions
+                .skipped
+                .iter()
+                .map(|r| {
+                    let start = if r.start > 0 && source.as_bytes()[r.start - 1] == b'\n' {
+                        r.start - 1
+                    } else {
+                        r.start
+                    };
+                    start..r.end
+                })
+                .collect(),
         }
     }
     /// A visible escaped character and its backslash are one editing unit.
     pub fn expand_escapes(&self, mut range: Range<usize>) -> Range<usize> {
-        for escape in &self.escapes {
+        for escape in self.escapes.iter().chain(&self.atomic) {
             if escape.start < range.start && range.start < escape.end {
                 range.start = escape.start;
             }
@@ -336,10 +450,68 @@ impl Projection {
         }
         range
     }
+    /// A collapsed-caret delete must not consume invisible definitions or block delimiters.
+    pub fn protect_delete(&self, mut range: Range<usize>, forward: bool) -> Range<usize> {
+        let mut blocks = self
+            .protected
+            .iter()
+            .filter(|r| r.start < range.end && range.start < r.end)
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|r| r.start);
+        if !forward {
+            blocks.reverse();
+        }
+        for block in blocks {
+            if forward {
+                if range.start < block.start {
+                    range.end = range.end.min(block.start);
+                    break;
+                }
+                range.start = range.start.max(block.end).min(range.end);
+            } else {
+                if block.end < range.end {
+                    range.start = range.start.max(block.end);
+                    break;
+                }
+                range.end = range.end.min(block.start).max(range.start);
+            }
+        }
+        range
+    }
+    pub fn block_start(&self, index: usize) -> usize {
+        let line = &self.lines[index];
+        if let Some(block) = line.code_block {
+            self.blocks[block].source.start
+        } else if let Some(cell) = &line.cell {
+            self.tables[cell.table].source.start
+        } else if let Some(picture) = line.picture {
+            self.pictures[picture].source.start
+        } else if let Some(math) = self
+            .math_blocks
+            .iter()
+            .find(|range| range.start <= line.source.start && line.source.start < range.end)
+        {
+            math.start
+        } else {
+            line.source.start
+        }
+    }
     pub fn line_for_source(&self, source: usize) -> usize {
-        self.lines
+        let index = self
+            .lines
             .partition_point(|line| line.source.start <= source)
-            .saturating_sub(1)
+            .saturating_sub(1);
+        if let Some(cell) = self.lines[index].cell.as_ref().filter(|cell| cell.missing) {
+            return self.lines[..=index]
+                .iter()
+                .rposition(|line| {
+                    line.cell
+                        .as_ref()
+                        .is_some_and(|c| c.table == cell.table && c.row == cell.row && !c.missing)
+                })
+                .unwrap_or(index.saturating_sub(cell.column));
+        }
+        index
     }
     pub fn is_inline_marker(&self, range: Range<usize>) -> bool {
         self.inline_markers.contains(&range)
