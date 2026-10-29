@@ -5799,8 +5799,10 @@ dependencies = [
 name = "type-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui",
  "markdown-core",
+ "tempfile",
 ]
 
 [[package]]

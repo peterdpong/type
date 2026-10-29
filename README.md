@@ -8,6 +8,7 @@ On macOS, install Rust and the Xcode command-line tools.
 
 ```sh
 cargo run -p type-app
+cargo run -p type-app -- examples/welcome.md
 ```
 
 ## Format

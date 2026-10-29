@@ -12,3 +12,9 @@ path = "src/main.rs"
 [dependencies]
 gpui.workspace = true
 markdown-core = { path = "../markdown-core" }
+anyhow = "1"
+tempfile = "3"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
