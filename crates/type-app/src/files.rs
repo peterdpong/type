@@ -14,6 +14,20 @@ pub fn read(path: &Path) -> Result<(PathBuf, String)> {
     Ok((path, text))
 }
 
+/// Resolve aliases for open tabs and in-flight Save As destinations, including new files.
+pub fn identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match (parent.canonicalize(), path.file_name()) {
+            (Ok(parent), Some(name)) => parent.join(name),
+            _ => path.to_path_buf(),
+        }
+    })
+}
+
 /// Atomically save UTF-8 text, preserving permissions and symlink targets.
 pub fn save(path: &Path, text: &str, expected: Option<&str>) -> Result<PathBuf> {
     // Save to the symlink target.

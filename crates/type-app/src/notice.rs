@@ -136,7 +136,7 @@ impl Render for Notice {
             .debug_selector(|| "file-notice".into())
             .absolute()
             .right(px(20.))
-            .top(px(64.))
+            .top(px(appearance::TOP_GUTTER + 8.))
             .max_w((window.viewport_size().width * 0.4).min(px(360.)))
             .flex()
             .items_start()
@@ -195,7 +195,7 @@ impl Render for Notice {
                 move |view, progress| {
                     let visibility = if exiting { 1. - progress } else { progress };
                     view.opacity(visibility)
-                        .top(px(64. - (1. - visibility) * 8.))
+                        .top(px(appearance::TOP_GUTTER + 8. - (1. - visibility) * 8.))
                 },
             )
             .into_any_element()
