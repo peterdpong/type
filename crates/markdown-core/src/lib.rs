@@ -11,10 +11,11 @@ mod typing;
 
 pub use document::Document;
 pub use editor::{
-    Bold, BulletList, Copy, Cut, Heading1, Heading2, Heading3, Heading4, Heading5, Heading6,
-    InlineCode, Italic, OrderedList, Paste, Quote, Redo, SelectAll, TaskList, ToggleTask, Undo,
+    Bold, BulletList, Copy, Cut, Find, FindNext, FindPrevious, Heading1, Heading2, Heading3,
+    Heading4, Heading5, Heading6, InlineCode, Italic, OrderedList, Paste, Quote, Redo, SelectAll,
+    TaskList, ToggleTask, Undo,
 };
-pub use editor::{EditorEvent, Format, MarkdownEditor, init};
+pub use editor::{EditorEvent, Format, MarkdownEditor, MarkdownPreview, init};
 
 mod text_input;
 pub use text_input::{TextInput, TextInputEvent};

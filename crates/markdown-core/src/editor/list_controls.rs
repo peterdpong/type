@@ -15,6 +15,7 @@ pub(super) fn toggle(editor: &mut MarkdownEditor, offset: usize, cx: &mut Contex
     if editor.document.toggle_checkbox(offset) {
         editor.selecting = false;
         editor.changed(cx);
+        editor.toolbelt_dismissed = true;
         editor.reveal_cursor = false;
     }
 }

@@ -14,7 +14,12 @@ use gpui::{
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 pub(crate) mod caret;
+mod find;
 mod list_controls;
+mod outline;
+mod preview;
+mod toolbelt;
+pub use preview::MarkdownPreview;
 
 actions!(
     markdown_core,
@@ -39,6 +44,9 @@ actions!(
         TaskList,
         ToggleTask,
         Quote,
+        Find,
+        FindNext,
+        FindPrevious
     ]
 );
 
@@ -80,6 +88,9 @@ pub fn init(cx: &mut App) {
         bind!("shift-l", TaskList),
         bind!("enter", ToggleTask),
         bind!("shift-9", Quote),
+        bind!("f", Find),
+        bind!("g", FindNext),
+        bind!("shift-g", FindPrevious),
     ]);
 }
 
@@ -103,16 +114,23 @@ pub enum Format {
 pub enum EditorEvent {
     Changed,
     SelectionChanged,
+    FindVisibilityChanged,
 }
 
 /// An embeddable, native GPUI Markdown editing surface. It owns no files or dialogs.
 pub struct MarkdownEditor {
     document: Document,
     projection: Projection,
+    find: find::State,
     focus: FocusHandle,
     marked: Option<Range<usize>>,
     selecting: bool,
+    toolbelt_dismissed: bool,
+    // GPUI 0.2's debug selector map retains removed elements across frames.
+    #[cfg(test)]
+    toolbelt_bounds: Option<Bounds<Pixels>>,
     focus_subscriptions: Vec<gpui::Subscription>,
+    outline: outline::Outline,
     caret_animation: caret::Caret,
     scroll: Pixels,
     max_scroll: Pixels,
@@ -232,10 +250,15 @@ impl MarkdownEditor {
         let mut editor = Self {
             document,
             projection,
+            find: find::State::new(cx),
             focus: cx.focus_handle(),
             marked: None,
             selecting: false,
+            toolbelt_dismissed: false,
+            #[cfg(test)]
+            toolbelt_bounds: None,
             focus_subscriptions: Vec::new(),
+            outline: outline::Outline::default(),
             caret_animation: caret::Caret::new(cx.background_executor().now()),
             scroll: px(0.),
             max_scroll: px(0.),
@@ -256,8 +279,12 @@ impl MarkdownEditor {
     /// Finish composition and hide transient controls before moving this editor out of view.
     /// The document, selection, undo history, typing styles, and scroll position are retained.
     pub fn deactivate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        find::hide(self, cx);
         self.finish_composition(window, cx);
         self.selecting = false;
+        self.toolbelt_dismissed = true;
+        self.outline.collapse_immediately();
+        self.outline.clear_backdrop(window);
         self.caret_animation = caret::Caret::new(cx.background_executor().now());
         cx.notify();
     }
@@ -273,8 +300,17 @@ impl MarkdownEditor {
         self.document.text()
     }
 
+    /// A small, inert snapshot of the current rendered document, including unsaved edits.
+    pub fn preview(&self) -> MarkdownPreview {
+        MarkdownPreview::new(&self.projection)
+    }
+
+    pub fn is_find_open(&self) -> bool {
+        self.find.open
+    }
+
     fn top_gutter(&self) -> f32 {
-        appearance::TOP_GUTTER
+        appearance::TOP_GUTTER + if self.find.open { find::HEIGHT } else { 0. }
     }
 
     fn content_bounds(&self) -> Bounds<Pixels> {
@@ -332,6 +368,7 @@ impl MarkdownEditor {
         self.caret_animation = caret::Caret::new(cx.background_executor().now());
         self.marked = None;
         self.selecting = false;
+        self.outline.reset();
         self.scroll = px(0.);
         self.rebuild();
         self.document
@@ -365,10 +402,14 @@ impl MarkdownEditor {
     fn rebuild(&mut self) {
         self.layout_dirty = true;
         self.projection = Projection::new(self.document.text(), self.marked.is_some());
+        self.find.refresh(&self.projection, self.document.cursor());
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
+        self.outline.document_changed();
         self.caret_animation
             .activity(cx.background_executor().now());
+        self.outline.jumped_to = None;
+        self.toolbelt_dismissed = false;
         self.rebuild();
         self.reveal_cursor = true;
         self.preferred_x = None;
@@ -378,6 +419,8 @@ impl MarkdownEditor {
     fn move_to(&mut self, index: usize, extend: bool, cx: &mut Context<Self>) {
         self.caret_animation
             .activity(cx.background_executor().now());
+        self.outline.jumped_to = None;
+        self.toolbelt_dismissed = false;
         self.document.move_to(index, extend);
         self.reveal_cursor = true;
         cx.emit(EditorEvent::SelectionChanged);
@@ -668,7 +711,15 @@ impl MarkdownEditor {
             self.changed(cx);
         }
     }
-    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.focus.is_focused(window) {
+            return;
+        }
+        if event.keystroke.key == "escape" && self.find.open {
+            find::close(self, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.marked.is_some() {
             return;
         }
@@ -678,6 +729,11 @@ impl MarkdownEditor {
         let command = modifiers.platform;
         let word = modifiers.alt || (modifiers.control && !cfg!(target_os = "macos"));
         match key {
+            "escape" if self.outline.expanded || !self.document.selection().is_empty() => {
+                self.outline.expand(false);
+                self.toolbelt_dismissed = true;
+                cx.notify();
+            }
             "left" | "right" => {
                 let right = key == "right";
                 let range = self.document.selection();
@@ -827,6 +883,7 @@ impl MarkdownEditor {
         self.caret_animation
             .activity(cx.background_executor().now());
         window.focus(&self.focus);
+        self.toolbelt_dismissed = false;
         self.selecting = true;
         self.preferred_x = None;
         let index = self.hit_test(event.position);
@@ -959,6 +1016,10 @@ impl Render for MarkdownEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.focus_subscriptions.is_empty() {
             self.focus_subscriptions
+                .push(cx.on_release_in(window, |this, window, _| {
+                    this.outline.clear_backdrop(window);
+                }));
+            self.focus_subscriptions
                 .push(cx.on_focus(&self.focus, window, |this, _, cx| {
                     this.caret_animation
                         .activity(cx.background_executor().now());
@@ -985,6 +1046,15 @@ impl Render for MarkdownEditor {
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
             .on_key_down(cx.listener(Self::key_down))
+            .on_action(cx.listener(|this, _: &Find, window, cx| find::open(this, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &FindNext, window, cx| find::step(this, false, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &FindPrevious, window, cx| {
+                    find::step(this, true, window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &Undo, _, cx| {
                 this.marked = None;
                 this.document.undo();
@@ -998,6 +1068,7 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 this.caret_animation
                     .activity(cx.background_executor().now());
+                this.toolbelt_dismissed = false;
                 this.document.select(0, this.document.text().len());
                 cx.emit(EditorEvent::SelectionChanged);
                 cx.notify();
@@ -1051,6 +1122,7 @@ impl Render for MarkdownEditor {
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 this.caret_animation
                     .activity(cx.background_executor().now());
+                this.outline.jumped_to = None;
                 this.scroll = (this.scroll
                     - event.delta.pixel_delta(px(appearance::BODY_LINE_HEIGHT)).y)
                     .clamp(px(0.), this.max_scroll);
@@ -1060,6 +1132,7 @@ impl Render for MarkdownEditor {
             .child(EditorSurface {
                 editor: cx.entity(),
             })
+            .children(find::render(self, cx))
     }
 }
 
@@ -1105,13 +1178,21 @@ impl Element for EditorSurface {
         self.editor.update(cx, |editor, cx| {
             if !editor.layout_dirty
                 && !editor.reveal_cursor
+                && !editor.find.reveal
                 && editor.bounds == bounds
                 && editor.layout_scroll == editor.scroll
             {
                 list_controls::show(editor, window, cx);
+                outline::show(editor, window, cx);
+                toolbelt::show(editor, window, cx);
                 return caret::prepare(editor, window, cx);
             }
-            let left_margin = px(24.);
+            if editor.marked.is_none() {
+                editor.outline.has_headings =
+                    editor.projection.lines.iter().any(|line| line.heading > 0);
+            }
+            let has_outline = editor.outline.has_headings;
+            let left_margin = if has_outline { px(72.) } else { px(24.) };
             let width = (bounds.size.width - left_margin - px(24.))
                 .clamp(px(80.), px(appearance::CONTENT_WIDTH));
             let x = bounds.left() + ((bounds.size.width - width) / 2.).max(left_margin);
@@ -1297,6 +1378,7 @@ impl Element for EditorSurface {
                 }
                 editor.reveal_cursor = false;
             }
+            find::reveal(editor, &layout, bounds);
             for line in &mut layout {
                 line.origin.y -= editor.scroll;
             }
@@ -1310,6 +1392,8 @@ impl Element for EditorSurface {
             editor.layout_revision = editor.layout_revision.wrapping_add(1);
             editor.layout_scroll = editor.scroll;
             list_controls::show(editor, window, cx);
+            outline::show(editor, window, cx);
+            toolbelt::show(editor, window, cx);
             caret::prepare(editor, window, cx)
         })
     }
@@ -1339,7 +1423,27 @@ impl Element for EditorSurface {
         let max_scroll = editor.max_scroll;
         let scroll = editor.scroll;
         let bounds = editor.content_bounds();
-        let show_selection = true;
+        let show_selection = !editor.find.open || editor.focus.is_focused(window);
+        let first = layout.partition_point(|line| line.origin.y + line.height < bounds.top());
+        let last = layout.partition_point(|line| line.origin.y <= bounds.bottom());
+        let highlights = if editor.find.open {
+            let matches = &editor.find.matches;
+            let start = matches.partition_point(|found| found.line < first);
+            let end = matches.partition_point(|found| found.line < last);
+            matches[start..end]
+                .iter()
+                .enumerate()
+                .map(|(i, found)| {
+                    (
+                        found.line,
+                        found.range.clone(),
+                        editor.find.active == Some(start + i),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for panel in &panels {
                 if panel.bounds.bottom() >= bounds.top() && panel.bounds.top() <= bounds.bottom() {
@@ -1400,6 +1504,16 @@ impl Element for EditorSurface {
                     window,
                     cx,
                 );
+                for (_, range, active) in highlights
+                    .iter()
+                    .skip(highlights.partition_point(|(line, _, _)| *line < i))
+                    .take_while(|(line, _, _)| *line == i)
+                {
+                    for rect in line.display_rects(range.clone()) {
+                        window
+                            .paint_quad(fill(rect, rgb(if *active { 0xffc96a } else { 0xffedb0 })));
+                    }
+                }
                 if show_selection {
                     for rect in line.selection_rects(projected, &selection) {
                         window.paint_quad(fill(rect, rgb(appearance::SELECTION)));
@@ -1518,6 +1632,37 @@ mod tests {
                 assert!(e.caret().unwrap().0.y >= e.content_bounds().top())
             });
         }
+    }
+
+    #[gpui::test]
+    fn deactivation_preserves_selection_scroll_and_history_and_hides_transient_controls(
+        cx: &mut TestAppContext,
+    ) {
+        let source = format!("# Heading\n\n{}", "A paragraph\n\n".repeat(100));
+        let (editor, cx) = setup(cx, &source);
+        editor.update_in(cx, |e, window, cx| {
+            e.document.input(source.len()..source.len(), "!", true);
+            e.changed(cx);
+            e.document.select(9, 4);
+            e.scroll = px(200.);
+            e.reveal_cursor = false;
+            e.outline.expand(true);
+            e.selecting = true;
+            e.deactivate(window, cx);
+            assert_eq!(e.document.cursor(), 4);
+            assert_eq!(e.document.anchor(), 9);
+            assert_eq!(e.scroll, px(200.));
+            assert!(!e.outline.is_open());
+            assert!(!e.selecting);
+        });
+        cx.run_until_parked();
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.scroll, px(200.));
+            assert_eq!(e.document.selection(), 4..9);
+            assert!(e.toolbelt_bounds.is_none());
+        });
+        cx.dispatch_action(Undo);
+        editor.read_with(cx, |e, _| assert_eq!(e.markdown(), source));
     }
 
     #[gpui::test]
@@ -2328,6 +2473,170 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn toolbelt_follows_drag_selection_and_keeps_it_when_formatting(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "Hello world");
+        let (start, end) = editor.read_with(cx, |e, _| {
+            let line = &e.layout[0];
+            (
+                line.position(0) + point(px(0.), line.line_height / 2.),
+                line.position(5) + point(px(0.), line.line_height / 2.),
+            )
+        });
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::default());
+        assert!(editor.read_with(cx, |e, _| e.toolbelt_bounds.is_none()));
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
+        assert!(cx.debug_bounds("selection-toolbelt").is_some());
+        let bold = cx.debug_bounds("toolbelt-bold").unwrap().center();
+        cx.simulate_click(bold, gpui::Modifiers::default());
+        editor.update_in(cx, |e, window, _| {
+            assert_eq!(e.markdown(), "**Hello** world");
+            assert_eq!(e.document.selection(), 2..7);
+            assert!(e.format_active(Format::Bold));
+            assert!(e.focus.is_focused(window));
+        });
+        let italic = cx.debug_bounds("toolbelt-italic").unwrap().center();
+        cx.simulate_click(italic, gpui::Modifiers::default());
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.markdown(), "**_Hello_** world");
+            assert!(e.format_active(Format::Bold));
+            assert!(e.format_active(Format::Italic));
+        });
+        let dismissed_button = cx.debug_bounds("toolbelt-bold").unwrap().center();
+        cx.simulate_keystrokes("escape");
+        assert!(editor.read_with(cx, |e, _| e.toolbelt_bounds.is_none()));
+        editor.read_with(cx, |e, _| assert!(!e.document.selection().is_empty()));
+        cx.simulate_click(dismissed_button, gpui::Modifiers::default());
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.markdown(), "**_Hello_** world");
+            assert!(e.document.selection().is_empty());
+        });
+        cx.simulate_keystrokes("home shift-right");
+        assert!(editor.read_with(cx, |e, _| e.toolbelt_bounds.is_some()));
+    }
+
+    #[gpui::test]
+    fn toolbelt_toggles_existing_inline_styles_and_preserves_whitespace(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "");
+        for (source, button, expected) in [
+            ("**word**", "toolbelt-bold", "word"),
+            ("__word__", "toolbelt-bold", "word"),
+            ("*word*", "toolbelt-italic", "word"),
+            ("_word_", "toolbelt-italic", "word"),
+            ("`word`", "toolbelt-code", "word"),
+            ("**_word_**", "toolbelt-italic", "**word**"),
+            ("_**word**_", "toolbelt-bold", "_word_"),
+        ] {
+            editor.update_in(cx, |e, _, cx| e.set_markdown(source, cx));
+            cx.dispatch_action(SelectAll);
+            let control = cx.debug_bounds(button).unwrap().center();
+            cx.simulate_click(control, gpui::Modifiers::default());
+            editor.read_with(cx, |e, _| {
+                assert_eq!(e.markdown(), expected, "{source}");
+                assert_eq!(&e.markdown()[e.document.selection()], "word");
+            });
+            cx.dispatch_action(Undo);
+            editor.read_with(cx, |e, _| assert_eq!(e.markdown(), source));
+        }
+        editor.update_in(cx, |e, _, cx| e.set_markdown("word ", cx));
+        cx.dispatch_action(SelectAll);
+        let bold = cx.debug_bounds("toolbelt-bold").unwrap().center();
+        cx.simulate_click(bold, gpui::Modifiers::default());
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.markdown(), "**word** ");
+            assert_eq!(e.projection.lines[0].text, "word ");
+            assert!(e.format_active(Format::Bold));
+        });
+    }
+
+    #[gpui::test]
+    fn toolbelt_can_remove_a_style_from_part_of_a_unicode_span(cx: &mut TestAppContext) {
+        let (editor, cx) = setup(cx, "**aé🦀z**");
+        editor.update_in(cx, |e, _, cx| {
+            e.document.select(3, 9);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bold = cx.debug_bounds("toolbelt-bold").unwrap().center();
+        cx.simulate_click(bold, gpui::Modifiers::default());
+        editor.read_with(cx, |e, _| {
+            assert_eq!(e.markdown(), "**a**é🦀**z**");
+            assert_eq!(&e.markdown()[e.document.selection()], "é🦀");
+            assert_eq!(e.projection.lines[0].text, "aé🦀z");
+            assert!(!e.format_active(Format::Bold));
+        });
+        cx.dispatch_action(Undo);
+        editor.read_with(cx, |e, _| assert_eq!(e.markdown(), "**aé🦀z**"));
+    }
+
+    #[gpui::test]
+    fn toolbelt_copies_code_without_exposing_inline_format_actions(cx: &mut TestAppContext) {
+        let source = "```\ncode\n```\nAfter";
+        let (editor, cx) = setup(cx, source);
+        cx.dispatch_action(SelectAll);
+        assert!(cx.debug_bounds("toolbelt-bold").is_none());
+        let copy = cx.debug_bounds("toolbelt-copy").unwrap().center();
+        cx.simulate_click(copy, gpui::Modifiers::default());
+        editor.read_with(cx, |e, cx| {
+            assert_eq!(e.markdown(), source);
+            assert_eq!(e.document.selection(), 0..source.len());
+            assert_eq!(cx.read_from_clipboard().unwrap().text().unwrap(), source);
+        });
+        cx.simulate_keystrokes("right");
+        assert!(editor.read_with(cx, |e, _| e.toolbelt_bounds.is_none()));
+    }
+
+    #[gpui::test]
+    fn toolbelt_repositions_for_wrapping_and_scroll_and_hides_offscreen(cx: &mut TestAppContext) {
+        let source = "wrapped selection ".repeat(100);
+        let (editor, cx) = setup(cx, &source);
+        cx.simulate_resize(size(px(360.), px(260.)));
+        editor.update_in(cx, |e, _, cx| {
+            e.document.select(0, source.len());
+            e.reveal_cursor = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let before = cx.debug_bounds("selection-toolbelt").unwrap();
+        assert!(before.left() >= px(8.) && before.right() <= px(352.));
+        assert!(before.top() >= px(56.) && before.bottom() <= px(252.));
+        editor.update_in(cx, |e, _, cx| {
+            e.scroll = px(200.);
+            e.reveal_cursor = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let after = cx.debug_bounds("selection-toolbelt").unwrap();
+        assert_ne!(before.top(), after.top());
+        assert!(after.top() >= px(56.) && after.bottom() <= px(252.));
+        editor.update_in(cx, |e, _, cx| {
+            e.document.select(0, 4);
+            e.reveal_cursor = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(editor.read_with(cx, |e, _| e.toolbelt_bounds.is_none()));
+    }
+
+    #[gpui::test]
+    fn toolbelt_hides_when_focus_leaves_and_when_typing_replaces_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (editor, cx) = setup(cx, "Selected");
+        cx.dispatch_action(SelectAll);
+        assert!(cx.debug_bounds("selection-toolbelt").is_some());
+        let other = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, _| window.focus(&other));
+        cx.run_until_parked();
+        assert!(editor.read_with(cx, |e, _| e.toolbelt_bounds.is_none()));
+        editor.update_in(cx, |e, window, _| window.focus(&e.focus));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("selection-toolbelt").is_some());
+        cx.simulate_input("Replaced");
+        assert!(editor.read_with(cx, |e, _| e.toolbelt_bounds.is_none()));
+        editor.read_with(cx, |e, _| assert_eq!(e.markdown(), "Replaced"));
+    }
     #[gpui::test]
     fn deleting_the_last_struck_character_removes_its_markers_and_undo_restores_it(
         cx: &mut TestAppContext,

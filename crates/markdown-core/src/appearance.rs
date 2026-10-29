@@ -46,3 +46,35 @@ pub(crate) fn heading_style(level: usize) -> Option<HeadingStyle> {
         color: if level == 6 { MUTED } else { TEXT },
     })
 }
+
+#[cfg(target_os = "macos")]
+pub(crate) fn native_font(size: f64, bold: bool, italic: bool) -> Option<core_text::font::CTFont> {
+    use core_foundation::{
+        base::TCFType, dictionary::CFDictionary, number::CFNumber, string::CFString,
+    };
+    use core_text::{font, font_descriptor::*};
+    let font = font::new_from_name(".AppleSystemUIFont", size).ok()?;
+    let descriptor = if bold {
+        let traits = CFDictionary::from_CFType_pairs(&[(
+            unsafe { CFString::wrap_under_get_rule(kCTFontWeightTrait) },
+            CFNumber::from(0.3_f64).as_CFType(),
+        )]);
+        font.copy_descriptor()
+            .create_copy_with_attributes(
+                CFDictionary::from_CFType_pairs(&[(
+                    unsafe { CFString::wrap_under_get_rule(kCTFontTraitsAttribute) },
+                    traits.as_CFType(),
+                )])
+                .to_untyped(),
+            )
+            .ok()?
+    } else {
+        font.copy_descriptor()
+    };
+    let font = font::new_from_descriptor(&descriptor, size);
+    if italic {
+        font.clone_with_symbolic_traits(kCTFontItalicTrait, kCTFontItalicTrait)
+    } else {
+        Some(font)
+    }
+}
