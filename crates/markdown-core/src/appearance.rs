@@ -2,7 +2,7 @@
 pub const FONT_FAMILY: &str = ".SystemUIFont";
 pub const UI_SIZE: f32 = 13.;
 pub const BODY_SIZE: f32 = 15.;
-pub const TOP_GUTTER: f32 = 40.;
+pub const TOP_GUTTER: f32 = 56.;
 pub const BODY_LINE_HEIGHT: f32 = BODY_SIZE * 1.75;
 pub const PARAGRAPH_GAP: f32 = BODY_SIZE * 1.25;
 pub const CODE_SIZE: f32 = BODY_SIZE * 0.85;
@@ -20,3 +20,29 @@ pub const CHROME: u32 = 0xefefed;
 pub const CHROME_BORDER: u32 = 0xdededa;
 pub const CHROME_HOVER: u32 = 0xe5e5e1;
 pub const CHROME_RADIUS: f32 = 8.;
+
+#[derive(Clone, Copy)]
+pub(crate) struct HeadingStyle {
+    pub size: f32,
+    pub line_height: f32,
+    pub space_before: f32,
+    pub color: u32,
+}
+
+pub(crate) fn heading_style(level: usize) -> Option<HeadingStyle> {
+    let (size, line_height, space_before) = match level {
+        1 => (32., 44., 40.),
+        2 => (26., 38., 32.),
+        3 => (21., 32., 24.),
+        4 => (18., 28., 20.),
+        5 => (16., 26., 16.),
+        6 => (15., 25., 12.),
+        _ => return None,
+    };
+    Some(HeadingStyle {
+        size,
+        line_height,
+        space_before,
+        color: if level == 6 { MUTED } else { TEXT },
+    })
+}

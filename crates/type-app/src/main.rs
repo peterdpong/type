@@ -1,17 +1,17 @@
 use gpui::{prelude::*, *};
-use markdown_core::{TextInput, appearance};
+use markdown_core::{MarkdownEditor, appearance};
 actions!(type_app, [Quit]);
 struct Workspace {
-    input: Entity<TextInput>,
+    input: Entity<MarkdownEditor>,
 }
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .bg(rgb(appearance::BACKGROUND))
-            .p(px(32.))
+            .font_family(appearance::FONT_FAMILY)
             .on_action(|_: &Quit, _, cx| cx.quit())
-            .child(div().w_full().h(px(36.)).child(self.input.clone()))
+            .child(self.input.clone())
     }
 }
 fn main() {
@@ -41,7 +41,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let input = cx.new(|cx| TextInput::new("editor", "Start writing…", cx));
+                let input = cx.new(|cx| MarkdownEditor::new("", cx));
                 window.focus(&input.focus_handle(cx));
                 cx.new(|_| Workspace { input })
             },
