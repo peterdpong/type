@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/markdown-core", "crates/type-app"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+pulldown-cmark = "0.13"
+unicode-segmentation = "1.12"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = "thin"
+strip = true
+

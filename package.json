@@ -1,0 +1,11 @@
+{
+  "name": "type",
+  "private": true,
+  "scripts": {
+    "format": "cargo fmt --all && prettier --write .",
+    "format:check": "cargo fmt --all -- --check && prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "3.9.10"
+  }
+}
